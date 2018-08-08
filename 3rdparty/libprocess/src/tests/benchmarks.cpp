@@ -22,6 +22,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <process/collect.hpp>
@@ -33,6 +34,9 @@
 #include <process/process.hpp>
 #include <process/protobuf.hpp>
 
+#include <process/metrics/counter.hpp>
+#include <process/metrics/metrics.hpp>
+
 #include <stout/duration.hpp>
 #include <stout/gtest.hpp>
 #include <stout/hashset.hpp>
@@ -40,7 +44,10 @@
 
 #include "benchmarks.pb.h"
 
+#include "mpsc_linked_queue.hpp"
+
 namespace http = process::http;
+namespace metrics = process::metrics;
 
 using process::CountDownLatch;
 using process::Future;
@@ -53,15 +60,28 @@ using process::UPID;
 
 using std::cout;
 using std::endl;
-using std::list;
 using std::ostringstream;
 using std::string;
 using std::vector;
+
+using testing::WithParamInterface;
 
 int main(int argc, char** argv)
 {
   // Initialize Google Mock/Test.
   testing::InitGoogleMock(&argc, argv);
+
+  // NOTE: Windows does not support signal semantics required for these
+  // handlers to be useful.
+#ifndef __WINDOWS__
+  // Install GLOG's signal handler.
+  google::InstallFailureSignalHandler();
+
+  // We reset the GLOG's signal handler for SIGTERM because
+  // 'SubprocessTest.Status' sends SIGTERM to a subprocess which
+  // results in a stack trace otherwise.
+  os::signals::reset(SIGTERM);
+#endif // __WINDOWS__
 
   // Add the libprocess test event listeners.
   ::testing::TestEventListeners& listeners =
@@ -91,10 +111,10 @@ public:
       totalRequests(0),
       concurrency(0) {}
 
-  virtual ~ClientProcess() {}
+  ~ClientProcess() override {}
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     install("pong", &ClientProcess::pong);
 
@@ -131,7 +151,7 @@ private:
     if (messageSize.isError()) {
       return http::BadRequest("Invalid 'messageSize': " + messageSize.error());
     }
-    message = string(messageSize.get().bytes(), '1');
+    message = string(messageSize->bytes(), '1');
 
     Try<size_t> numify_ = numify<size_t>(parameters["requests"].get());
     if (numify_.isError()) {
@@ -204,10 +224,10 @@ private:
 class ServerProcess : public Process<ServerProcess>
 {
 public:
-  virtual ~ServerProcess() {}
+  ~ServerProcess() override {}
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // TODO(bmahler): Move in the message when move support is added.
     install("ping", &ServerProcess::ping);
@@ -261,12 +281,12 @@ TEST(ProcessTest, Process_BENCHMARK_ClientServer)
   Stopwatch watch;
   watch.start();
 
-  list<Future<http::Response>> futures;
+  vector<Future<http::Response>> futures;
   foreach (const Owned<ClientProcess>& client, clients) {
     futures.push_back(http::get(client->self(), "run", query));
   }
 
-  Future<list<http::Response>> responses = collect(futures);
+  Future<vector<http::Response>> responses = collect(futures);
   AWAIT_READY(responses);
 
   Duration elapsed = watch.elapsed();
@@ -279,7 +299,7 @@ TEST(ProcessTest, Process_BENCHMARK_ClientServer)
 
     Try<Duration> elapsed = Duration::parse(response.body);
     ASSERT_SOME(elapsed);
-    double throughput = numRequests / elapsed.get().secs();
+    double throughput = numRequests / elapsed->secs();
 
     cout << "Client " << i << ": " << throughput << " rpcs / sec" << endl;
 
@@ -304,7 +324,7 @@ class LinkerProcess : public Process<LinkerProcess>
 public:
   LinkerProcess(const UPID& _to) : to(_to) {}
 
-  virtual void initialize()
+  void initialize() override
   {
     link(to);
   }
@@ -525,8 +545,11 @@ public:
       return Nothing();
     }
 
-    dispatch(self(), &Self::_handler).then(
-        defer(self(), &Self::handler<T>, data));
+    // NOTE: The prefix `this->` is required here, otherwise it will
+    // not compile when permissiveness is disabled (e.g. with MSVC on
+    // Windows).
+    dispatch(this->self(), &Self::_handler).then(
+        defer(this->self(), &Self::handler<T>, data));
 
     return Nothing();
   }
@@ -564,7 +587,6 @@ private:
   long repeat;
   long count = 0;
 };
-
 
 TEST(ProcessTest, Process_BENCHMARK_DispatchDefer)
 {
@@ -674,10 +696,223 @@ private:
 // Measures performance of message passing in ProtobufProcess.
 TEST(ProcessTest, Process_BENCHMARK_ProtobufInstallHandler)
 {
-  const size_t submessages[] = {0, 1, 5, 10, 50, 100, 500, 1000, 5000, 10000};
+  const int submessages[] = {0, 1, 5, 10, 50, 100, 500, 1000, 5000, 10000};
 
   ProtobufInstallHandlerBenchmarkProcess process;
-  foreach (size_t num_submessages, submessages) {
+  foreach (int num_submessages, submessages) {
     process.run(num_submessages);
   }
+}
+
+
+TEST(ProcessTest, Process_BENCHMARK_MpscLinkedQueue)
+{
+  // NOTE: we set the total number of producers to be 1 less than the
+  // hardware concurrency so the consumer doesn't have to fight for
+  // processing time with the producers.
+  const unsigned int producerCount = std::thread::hardware_concurrency() - 1;
+  const int messageCount = 10000000;
+  const int totalCount = messageCount * producerCount;
+  std::string* s = new std::string("");
+  process::MpscLinkedQueue<std::string> q;
+
+  Stopwatch consumerWatch;
+
+  auto consumer = std::thread([totalCount, &q, &consumerWatch]() {
+    consumerWatch.start();
+    for (int i = totalCount; i > 0;) {
+      if (q.dequeue() != nullptr) {
+        i--;
+      }
+    }
+    consumerWatch.stop();
+  });
+
+  std::vector<std::thread> producers;
+
+  Stopwatch producerWatch;
+  producerWatch.start();
+
+  for (unsigned int t = 0; t < producerCount; t++) {
+    // We want to capture `messageCount`, `s`, and `&q` here. Since
+    // `messageCount` is a constant integer variable initialized with a
+    // compile-time expression in a "reaching scope", it can get captured
+    // without being mentioned in the capture list, see. e.g.,
+    // https://stackoverflow.com/a/43468519/176922.
+    //
+    // We capture implicitly instead of explicitly since this part of the
+    // standard is not supported by msvc, while clang supports it and emits a
+    // warning for unneeded captures.
+    producers.push_back(std::thread([&]() {
+      for (int i = 0; i < messageCount; i++) {
+        q.enqueue(s);
+      }
+    }));
+  }
+
+  for (std::thread& producer : producers) {
+    producer.join();
+  }
+
+  producerWatch.stop();
+
+  consumer.join();
+
+  Duration producerElapsed = producerWatch.elapsed();
+  Duration consumerElapsed = consumerWatch.elapsed();
+
+  double consumerThroughput = (double) totalCount / consumerElapsed.secs();
+  double producerThroughput = (double) totalCount / producerElapsed.secs();
+  double throughput = consumerThroughput + producerThroughput;
+
+  cout << "Estimated producer throughput (" << producerCount << " threads): "
+       << std::fixed << producerThroughput << " op/s" << endl;
+  cout << "Estimated consumer throughput: "
+       << std::fixed << consumerThroughput << " op/s" << endl;
+  cout << "Estimated total throughput: "
+       << std::fixed << throughput << " op/s" << endl;
+}
+
+
+class Metrics_BENCHMARK_Test : public ::testing::Test,
+                               public WithParamInterface<size_t>{};
+
+
+// Parameterized by the number of metrics.
+INSTANTIATE_TEST_CASE_P(
+    MetricsCount,
+    Metrics_BENCHMARK_Test,
+    ::testing::Values(1u, 100u, 1000u, 10000u, 100000u));
+
+
+// Tests the performance of metrics fetching when there
+// are a large number of metrics.
+TEST_P(Metrics_BENCHMARK_Test, Scalability)
+{
+  size_t metrics_count = GetParam();
+
+  vector<metrics::Counter> counters;
+  counters.reserve(metrics_count);
+
+  for (size_t i = 0; i < metrics_count; ++i) {
+    counters.push_back(
+        metrics::Counter("metrics/keys/can/be/somewhat/long/"
+                         "so/we/use/a/fairly/long/key/here/"
+                         "to/test/a/more/pathological/case/" +
+                         stringify(i)));
+  }
+
+  Stopwatch watch;
+  watch.start();
+  for (size_t i = 0; i < metrics_count; ++i) {
+    metrics::add(counters[i]).get();
+  }
+  watch.stop();
+
+  std::cout << "Added " << metrics_count << " counters in "
+            << watch.elapsed() << std::endl;
+
+  watch.start();
+  metrics::snapshot(None()).get();
+  watch.stop();
+
+  std::cout << "Snapshot of " << metrics_count << " counters in "
+              << watch.elapsed() << std::endl;
+
+  UPID upid("metrics", process::address());
+
+  watch.start();
+  http::get(upid, "snapshot").get();
+  watch.stop();
+
+  std::cout << "HTTP /snapshot of " << metrics_count << " counters in "
+              << watch.elapsed() << std::endl;
+
+  watch.start();
+  for (size_t i = 0; i < metrics_count; ++i) {
+    metrics::remove(counters[i]).get();
+  }
+  watch.stop();
+
+  std::cout << "Removed " << metrics_count << " counters in "
+            << watch.elapsed() << std::endl;
+}
+
+
+TEST(ProcessTest, Process_BENCHMARK_MpscLinkedQueueEmpty)
+{
+  const int messageCount = 1000000000;
+  process::MpscLinkedQueue<std::string> q;
+
+  Stopwatch consumerWatch;
+  consumerWatch.start();
+
+  for (int i = messageCount; i > 0; i--) {
+    q.dequeue();
+  }
+
+  consumerWatch.stop();
+
+  Duration consumerElapsed = consumerWatch.elapsed();
+
+  double consumerThroughput = messageCount / consumerElapsed.secs();
+
+  cout << "Estimated consumer throughput: "
+       << std::fixed << consumerThroughput << " op/s" << endl;
+}
+
+
+TEST(ProcessTest, Process_BENCHMARK_MpscLinkedQueueNonContendedRead)
+{
+  // NOTE: we set the total number of producers to be 1 less than the
+  // hardware concurrency so the consumer doesn't have to fight for
+  // processing time with the producers.
+  const unsigned int producerCount = std::thread::hardware_concurrency() - 1;
+  const int messageCount = 10000000;
+  const int totalCount = messageCount * producerCount;
+  std::string* s = new std::string("");
+  process::MpscLinkedQueue<std::string> q;
+
+  std::vector<std::thread> producers;
+  for (unsigned int t = 0; t < producerCount; t++) {
+    producers.push_back(std::thread([&]() {
+      for (int i = 0; i < messageCount; i++) {
+        q.enqueue(s);
+      }
+    }));
+  }
+
+  Stopwatch producerWatch;
+  producerWatch.start();
+
+  for (std::thread& producer : producers) {
+    producer.join();
+  }
+
+  producerWatch.stop();
+
+  Stopwatch consumerWatch;
+  consumerWatch.start();
+
+  for (int i = totalCount; i > 0;) {
+    if (q.dequeue() != nullptr) {
+      i--;
+    }
+  }
+
+  consumerWatch.stop();
+
+  Duration producerElapsed = producerWatch.elapsed();
+  Duration consumerElapsed = consumerWatch.elapsed();
+
+  double consumerThroughput = totalCount / consumerElapsed.secs();
+  double producerThroughput = totalCount / producerElapsed.secs();
+  double throughput = consumerThroughput + producerThroughput;
+
+  cout << "Estimated producer throughput (" << producerCount << " threads): "
+       << std::fixed << producerThroughput << " op/s" << endl;
+  cout << "Estimated consumer throughput: "
+       << std::fixed << consumerThroughput << " op/s" << endl;
+  cout << "Estimated total throughput: "
+       << std::fixed << throughput << " op/s" << endl;
 }

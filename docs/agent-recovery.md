@@ -61,7 +61,7 @@ behavior of a Mesos agent:
     - If reconfiguration_policy=additive, the agent will allow the new
       configuration to contain additional attributes, increased resourced or an
       additional fault domain. For a more detailed description, see
-      [this](https://git-wip-us.apache.org/repos/asf?p=mesos.git;a=blob;f=src/slave/compatibility.hpp;h=78b421a01abe5d2178c93832577577a7ba282b38;hb=HEAD#l37).
+      [this](https://gitbox.apache.org/repos/asf?p=mesos.git;a=blob;f=src/slave/compatibility.hpp;h=78b421a01abe5d2178c93832577577a7ba282b38;hb=HEAD#l37).
 
 * `recover`: Whether to recover status updates and reconnect with old
   executors [Default: reconnect]
@@ -80,10 +80,10 @@ behavior of a Mesos agent:
       executors and tasks running at an agent die when the agent dies and are
       not recovered.
 
-A restarted agent should re-register with master within a timeout (75 seconds
+A restarted agent should reregister with master within a timeout (75 seconds
 by default: see the `--max_agent_ping_timeouts` and `--agent_ping_timeout`
 [configuration flags](configuration.md)). If the agent takes longer than this
-timeout to re-register, the master shuts down the agent, which in turn will
+timeout to reregister, the master shuts down the agent, which in turn will
 shutdown any live executors/tasks.
 
 Therefore, it is highly recommended to automate the process of restarting an

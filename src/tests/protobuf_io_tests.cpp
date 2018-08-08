@@ -86,7 +86,7 @@ TEST_F(ProtobufIOTest, Basic)
 
   // Ensure we've hit the end of the file without reading a partial
   // protobuf.
-  ASSERT_TRUE(read.isNone());
+  ASSERT_NONE(read);
   ASSERT_EQ(writes, reads);
 
   os::close(fdw);
@@ -127,7 +127,7 @@ TEST_F(ProtobufIOTest, Append)
 
   // Ensure we've hit the end of the file without reading a partial
   // protobuf.
-  ASSERT_TRUE(read.isNone());
+  ASSERT_NONE(read);
   ASSERT_EQ(writes, reads);
 
   os::close(fd.get());
@@ -152,7 +152,7 @@ TEST_F(ProtobufIOTest, RepeatedPtrField)
   Try<Nothing> write = ::protobuf::write(file, expected);
   ASSERT_SOME(write);
 
-  Try<RepeatedPtrField<FrameworkID>> actual =
+  Result<RepeatedPtrField<FrameworkID>> actual =
     ::protobuf::read<RepeatedPtrField<FrameworkID>>(file);
 
   ASSERT_SOME(actual);

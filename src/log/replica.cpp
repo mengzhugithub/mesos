@@ -65,7 +65,7 @@ public:
   // directory for storing the underlying log.
   explicit ReplicaProcess(const string& path);
 
-  virtual ~ReplicaProcess();
+  ~ReplicaProcess() override;
 
   // Returns the action associated with this position. A none result
   // means that no action is known for this position. An error result
@@ -775,13 +775,13 @@ void ReplicaProcess::restore(const string& path)
   }
 
   // Pull out and save some of the state.
-  metadata = state.get().metadata;
-  begin = state.get().begin;
-  end = state.get().end;
-  unlearned = state.get().unlearned;
+  metadata = state->metadata;
+  begin = state->begin;
+  end = state->end;
+  unlearned = state->unlearned;
 
   // Only use the learned positions to help determine the holes.
-  const IntervalSet<uint64_t>& learned = state.get().learned;
+  const IntervalSet<uint64_t>& learned = state->learned;
 
   // Holes are those positions in [begin, end] that are not in both
   // learned and unlearned sets. In the case of a brand new log (begin

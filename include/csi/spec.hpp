@@ -17,14 +17,19 @@
 #ifndef __CSI_SPEC_HPP__
 #define __CSI_SPEC_HPP__
 
+// ONLY USEFUL AFTER RUNNING PROTOC.
+#include <csi/csi.pb.h>
+
 // ONLY USEFUL AFTER RUNNING PROTOC WITH GRPC CPP PLUGIN.
 #include <csi/csi.grpc.pb.h>
 
 namespace mesos {
 namespace csi {
+namespace v0 {
 
-using namespace ::csi;
+using namespace ::csi::v0;
 
+} // namespace v0 {
 } // namespace csi {
 } // namespace mesos {
 

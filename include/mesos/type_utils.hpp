@@ -62,6 +62,8 @@ bool operator==(const ExecutorInfo& left, const ExecutorInfo& right);
 bool operator==(const Label& left, const Label& right);
 bool operator==(const Labels& left, const Labels& right);
 bool operator==(const MasterInfo& left, const MasterInfo& right);
+bool operator==(const Offer::Operation& left, const Offer::Operation& right);
+bool operator==(const Operation& left, const Operation& right);
 bool operator==(const OperationStatus& left, const OperationStatus& right);
 
 bool operator==(
@@ -84,6 +86,8 @@ bool operator==(const Volume& left, const Volume& right);
 bool operator!=(const CheckStatusInfo& left, const CheckStatusInfo& right);
 bool operator!=(const ExecutorInfo& left, const ExecutorInfo& right);
 bool operator!=(const Labels& left, const Labels& right);
+bool operator!=(const Offer::Operation& left, const Offer::Operation& right);
+bool operator!=(const Operation& left, const Operation& right);
 bool operator!=(const OperationStatus& left, const OperationStatus& right);
 
 bool operator!=(const TaskStatus& left, const TaskStatus& right);
@@ -755,6 +759,22 @@ struct hash<mesos::ResourceProviderID>
   {
     size_t seed = 0;
     boost::hash_combine(seed, resourceProviderId.value());
+    return seed;
+  }
+};
+
+
+template <>
+struct hash<mesos::UUID>
+{
+  typedef size_t result_type;
+
+  typedef mesos::UUID argument_type;
+
+  result_type operator()(const argument_type& uuid) const
+  {
+    size_t seed = 0;
+    boost::hash_combine(seed, uuid.value());
     return seed;
   }
 };

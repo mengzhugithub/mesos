@@ -67,7 +67,6 @@
 #include <stout/uuid.hpp>
 
 #include "common/http.hpp"
-#include "common/protobuf_utils.hpp"
 #include "common/resources_utils.hpp"
 
 #include "files/files.hpp"
@@ -91,7 +90,7 @@ namespace mesos {
 
 // Forward declarations.
 class Authorizer;
-class ObjectApprover;
+class ObjectApprovers;
 
 namespace internal {
 
@@ -124,7 +123,7 @@ Slave(Master* const _master,
         std::vector<SlaveInfo::Capability> _capabilites,
         const process::Time& _registeredTime,
         std::vector<Resource> _checkpointedResources,
-        const Option<id::UUID>& resourceVersion,
+        const Option<UUID>& _resourceVersion,
         std::vector<ExecutorInfo> executorInfos = std::vector<ExecutorInfo>(),
         std::vector<Task> tasks = std::vector<Task>());
 
@@ -152,7 +151,7 @@ Slave(Master* const _master,
 
   void removeOperation(Operation* operation);
 
-  Operation* getOperation(const id::UUID& uuid) const;
+  Operation* getOperation(const UUID& uuid) const;
 
   void addOffer(Offer* offer);
 
@@ -181,7 +180,7 @@ Slave(Master* const _master,
       const std::string& _version,
       const std::vector<SlaveInfo::Capability>& _capabilites,
       const Resources& _checkpointedResources,
-      const Option<id::UUID>& resourceVersion);
+      const Option<UUID>& resourceVersion);
 
   Master* const master;
   const SlaveID id;
@@ -209,10 +208,10 @@ Slave(Master* const _master,
   bool active;
 
   // Timer for marking slaves unreachable that become disconnected and
-  // don't re-register. This timeout is larger than the slave
+  // don't reregister. This timeout is larger than the slave
   // observer's timeout, so typically the slave observer will be the
   // one to mark such slaves unreachable; this timer is a backup for
-  // when a slave responds to pings but does not re-register (e.g.,
+  // when a slave responds to pings but does not reregister (e.g.,
   // because agent recovery has hung).
   Option<process::Timer> reregistrationTimer;
 
@@ -240,12 +239,12 @@ Slave(Master* const _master,
   hashmap<FrameworkID, hashmap<TaskID, Task*>> tasks;
 
   // Tasks that were asked to kill by frameworks.
-  // This is used for reconciliation when the slave re-registers.
+  // This is used for reconciliation when the slave reregisters.
   multihashmap<FrameworkID, TaskID> killedTasks;
 
   // Pending operations or terminal operations that have
   // unacknowledged status updates on this agent.
-  hashmap<id::UUID, Operation*> operations;
+  hashmap<UUID, Operation*> operations;
 
   // Active offers on this slave.
   hashset<Offer*> offers;
@@ -276,10 +275,44 @@ Slave(Master* const _master,
   // providers as well.
   Resources totalResources;
 
+  // Used to establish the relationship between the operation and the
+  // resources that the operation is operating on. Each resource
+  // provider will keep a resource version UUID, and change it when it
+  // believes that the resources from this resource provider are out
+  // of sync from the master's view.  The master will keep track of
+  // the last known resource version UUID for each resource provider,
+  // and attach the resource version UUID in each operation it sends
+  // out. The resource provider should reject operations that have a
+  // different resource version UUID than that it maintains, because
+  // this means the operation is operating on resources that might
+  // have already been invalidated.
+  Option<UUID> resourceVersion;
+
   SlaveObserver* observer;
 
-  hashmap<Option<ResourceProviderID>, id::UUID> resourceVersions;
-  hashmap<ResourceProviderID, ResourceProviderInfo> resourceProviders;
+  struct ResourceProvider {
+    ResourceProviderInfo info;
+    Resources totalResources;
+
+    // Used to establish the relationship between the operation and the
+    // resources that the operation is operating on. Each resource
+    // provider will keep a resource version UUID, and change it when it
+    // believes that the resources from this resource provider are out
+    // of sync from the master's view.  The master will keep track of
+    // the last known resource version UUID for each resource provider,
+    // and attach the resource version UUID in each operation it sends
+    // out. The resource provider should reject operations that have a
+    // different resource version UUID than that it maintains, because
+    // this means the operation is operating on resources that might
+    // have already been invalidated.
+    UUID resourceVersion;
+
+    // Pending operations or terminal operations that have
+    // unacknowledged status updates.
+    hashmap<UUID, Operation*> operations;
+  };
+
+  hashmap<ResourceProviderID, ResourceProvider> resourceProviders;
 
 private:
   Slave(const Slave&);              // No copying.
@@ -346,16 +379,19 @@ public:
               const Message& _heartbeatMessage,
               const HttpConnection& _http,
               const Duration& _interval,
-              const Option<Duration>& _delay = None())
+              const Option<Duration>& _delay = None(),
+              const Option<lambda::function<void(const Message&)>>&
+                _callback = None())
     : process::ProcessBase(process::ID::generate("heartbeater")),
       logMessage(_logMessage),
       heartbeatMessage(_heartbeatMessage),
       http(_http),
       interval(_interval),
-      delay(_delay) {}
+      delay(_delay),
+      callback(_callback) {}
 
 protected:
-  virtual void initialize() override
+  void initialize() override
   {
     if (delay.isSome()) {
       process::delay(
@@ -374,6 +410,10 @@ private:
     if (http.closed().isPending()) {
       VLOG(2) << "Sending heartbeat to " << logMessage;
 
+      if (callback.isSome()) {
+        callback.get()(heartbeatMessage);
+      }
+
       Message message(heartbeatMessage);
       http.send<Message, Event>(message);
     }
@@ -386,6 +426,7 @@ private:
   HttpConnection http;
   const Duration interval;
   const Option<Duration> delay;
+  const Option<lambda::function<void(const Message&)>> callback;
 };
 
 
@@ -402,7 +443,7 @@ public:
            slaveRemovalLimiter,
          const Flags& flags = Flags());
 
-  virtual ~Master();
+  ~Master() override;
 
   // Message handlers.
   void submitScheduler(
@@ -410,12 +451,11 @@ public:
 
   void registerFramework(
       const process::UPID& from,
-      const FrameworkInfo& frameworkInfo);
+      RegisterFrameworkMessage&& registerFrameworkMessage);
 
   void reregisterFramework(
       const process::UPID& from,
-      const FrameworkInfo& frameworkInfo,
-      bool failover);
+      ReregisterFrameworkMessage&& reregisterFrameworkMessage);
 
   void unregisterFramework(
       const process::UPID& from,
@@ -433,10 +473,7 @@ public:
 
   void launchTasks(
       const process::UPID& from,
-      const FrameworkID& frameworkId,
-      const std::vector<TaskInfo>& tasks,
-      const Filters& filters,
-      const std::vector<OfferID>& offerIds);
+      LaunchTasksMessage&& launchTasksMessage);
 
   void reviveOffers(
       const process::UPID& from,
@@ -450,24 +487,15 @@ public:
 
   void statusUpdateAcknowledgement(
       const process::UPID& from,
-      const SlaveID& slaveId,
-      const FrameworkID& frameworkId,
-      const TaskID& taskId,
-      const std::string& uuid);
+      StatusUpdateAcknowledgementMessage&& statusUpdateAcknowledgementMessage);
 
   void schedulerMessage(
       const process::UPID& from,
-      const SlaveID& slaveId,
-      const FrameworkID& frameworkId,
-      const ExecutorID& executorId,
-      const std::string& data);
+      FrameworkToExecutorMessage&& frameworkToExecutorMessage);
 
   void executorMessage(
       const process::UPID& from,
-      const SlaveID& slaveId,
-      const FrameworkID& frameworkId,
-      const ExecutorID& executorId,
-      const std::string& data);
+      ExecutorToFrameworkMessage&& executorToFrameworkMessage);
 
   void registerSlave(
       const process::UPID& from,
@@ -482,16 +510,14 @@ public:
       const SlaveID& slaveId);
 
   void statusUpdate(
-      StatusUpdate update,
-      const process::UPID& pid);
+      StatusUpdateMessage&& statusUpdateMessage);
 
   void reconcileTasks(
       const process::UPID& from,
-      const FrameworkID& frameworkId,
-      const std::vector<TaskStatus>& statuses);
+      ReconcileTasksMessage&& reconcileTasksMessage);
 
   void updateOperationStatus(
-      const UpdateOperationStatusMessage& update);
+      UpdateOperationStatusMessage&& update);
 
   void exitedExecutor(
       const process::UPID& from,
@@ -645,14 +671,8 @@ protected:
   // Invoked when the contender has entered the contest.
   void contended(const process::Future<process::Future<Nothing>>& candidacy);
 
-  // Task reconciliation, split from the message handler
-  // to allow re-use.
-  void _reconcileTasks(
-      Framework* framework,
-      const std::vector<TaskStatus>& statuses);
-
   // When a slave that was previously registered with this master
-  // re-registers, we need to reconcile the master's view of the
+  // reregisters, we need to reconcile the master's view of the
   // slave's tasks and executors.  This function also sends the
   // `SlaveReregisteredMessage`.
   void reconcileKnownSlave(
@@ -667,7 +687,7 @@ protected:
 
   // Recover a framework from its `FrameworkInfo`. This happens after
   // master failover, when an agent running one of the framework's
-  // tasks re-registers or when the framework itself re-registers,
+  // tasks reregisters or when the framework itself reregisters,
   // whichever happens first. The result of this function is a
   // registered, inactive framework with state `RECOVERED`.
   void recoverFramework(
@@ -676,7 +696,7 @@ protected:
 
   // Transition a framework from `RECOVERED` to `CONNECTED` state and
   // activate it. This happens at most once after master failover, the
-  // first time that the framework re-registers with the new master.
+  // first time that the framework reregisters with the new master.
   // Exactly one of `newPid` or `http` must be provided.
   Try<Nothing> activateRecoveredFramework(
       Framework* framework,
@@ -859,11 +879,85 @@ protected:
       const Offer::Operation::Destroy& destroy,
       const Option<process::http::authentication::Principal>& principal);
 
-  // Add the task and its executor (if not already running) to the
-  // framework and slave. Returns the resources consumed as a result,
-  // which includes resources for the task and its executor
-  // (if not already running).
-  Resources addTask(const TaskInfo& task, Framework* framework, Slave* slave);
+  /**
+   * Authorizes resize of a volume triggered by either `GROW_VOLUME` or
+   * `SHRINK_VOLUME` operations.
+   *
+   * Returns whether the triggering operation is authorized with the provided
+   * principal. This function is used for authorization of operations
+   * originating both from frameworks and operators. Note that operations may be
+   * validated AFTER authorization, so it's possible that the operation could be
+   * malformed.
+   *
+   * @param volume The volume being resized.
+   * @param principal An `Option` containing the principal attempting this
+   *     operation.
+   *
+   * @return A `Future` containing a boolean value representing the success or
+   *     failure of this authorization. A failed `Future` implies that
+   *     validation of the operation did not succeed.
+   */
+  process::Future<bool> authorizeResizeVolume(
+      const Resource& volume,
+      const Option<process::http::authentication::Principal>& principal);
+
+
+  /**
+   * Authorizes a `CREATE_DISK` operation.
+   *
+   * Returns whether the `CREATE_DISK` operation is authorized with the
+   * provided principal. This function is used for authorization of operations
+   * originating from frameworks. Note that operations may be validated AFTER
+   * authorization, so it's possible that the operation could be malformed.
+   *
+   * @param createDisk The `CREATE_DISK` operation to be performed.
+   * @param principal An `Option` containing the principal attempting this
+   *     operation.
+   *
+   * @return A `Future` containing a boolean value representing the success or
+   *     failure of this authorization. A failed `Future` implies that
+   *     validation of the operation did not succeed.
+   */
+  process::Future<bool> authorizeCreateDisk(
+      const Offer::Operation::CreateDisk& createDisk,
+      const Option<process::http::authentication::Principal>& principal);
+
+
+  /**
+   * Authorizes a `DESTROY_DISK` operation.
+   *
+   * Returns whether the `DESTROY_DISK` operation is authorized with the
+   * provided principal. This function is used for authorization of operations
+   * originating from frameworks. Note that operations may be validated AFTER
+   * authorization, so it's possible that the operation could be malformed.
+   *
+   * @param destroyDisk The `DESTROY_DISK` operation to be performed.
+   * @param principal An `Option` containing the principal attempting this
+   *     operation.
+   *
+   * @return A `Future` containing a boolean value representing the success or
+   *     failure of this authorization. A failed `Future` implies that
+   *     validation of the operation did not succeed.
+   */
+  process::Future<bool> authorizeDestroyDisk(
+      const Offer::Operation::DestroyDisk& destroyDisk,
+      const Option<process::http::authentication::Principal>& principal);
+
+
+  // Determine if a new executor needs to be launched.
+  bool isLaunchExecutor (
+      const ExecutorID& executorId,
+      Framework* framework,
+      Slave* slave) const;
+
+  // Add executor to the framework and slave.
+  void addExecutor(
+      const ExecutorInfo& executorInfo,
+      Framework* framework,
+      Slave* slave);
+
+  // Add task to the framework and slave.
+  void addTask(const TaskInfo& task, Framework* framework, Slave* slave);
 
   // Transitions the task, and recovers resources if the task becomes
   // terminal.
@@ -975,7 +1069,7 @@ private:
   // Call handlers.
   void receive(
       const process::UPID& from,
-      const scheduler::Call& call);
+      scheduler::Call&& call);
 
   void subscribe(
       HttpConnection http,
@@ -1008,14 +1102,15 @@ private:
 
   void accept(
       Framework* framework,
-      scheduler::Call::Accept accept);
+      scheduler::Call::Accept&& accept);
 
   void _accept(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& offeredResources,
-      const scheduler::Call::Accept& accept,
-      const process::Future<std::list<process::Future<bool>>>& authorizations);
+      scheduler::Call::Accept&& accept,
+      const process::Future<
+          std::vector<process::Future<bool>>>& authorizations);
 
   void acceptInverseOffers(
       Framework* framework,
@@ -1023,7 +1118,7 @@ private:
 
   void decline(
       Framework* framework,
-      const scheduler::Call::Decline& decline);
+      scheduler::Call::Decline&& decline);
 
   void declineInverseOffers(
       Framework* framework,
@@ -1043,23 +1138,23 @@ private:
 
   void acknowledge(
       Framework* framework,
-      const scheduler::Call::Acknowledge& acknowledge);
+      scheduler::Call::Acknowledge&& acknowledge);
 
   void acknowledgeOperationStatus(
       Framework* framework,
-      const scheduler::Call::AcknowledgeOperationStatus& acknowledge);
+      scheduler::Call::AcknowledgeOperationStatus&& acknowledge);
 
   void reconcile(
       Framework* framework,
-      const scheduler::Call::Reconcile& reconcile);
+      scheduler::Call::Reconcile&& reconcile);
 
-  void reconcileOperations(
+  scheduler::Response::ReconcileOperations reconcileOperations(
       Framework* framework,
       const scheduler::Call::ReconcileOperations& reconcile);
 
   void message(
       Framework* framework,
-      const scheduler::Call::Message& message);
+      scheduler::Call::Message&& message);
 
   void request(
       Framework* framework,
@@ -1094,22 +1189,6 @@ private:
    * (and access control is done via ACLs).
    */
   bool isWhitelistedRole(const std::string& name) const;
-
-  /**
-   * Indicates whether a task in the given state can safely be removed
-   * from the master's in-memory state. When a task becomes removable,
-   * it is erased from the master's primary task data structures; a
-   * limited number of such tasks are kept as a cache (see
-   * `framework.unreachableTasks` and `framework.completedTasks`).
-   */
-  static bool isRemovable(const TaskState& state)
-  {
-    if (state == TASK_UNREACHABLE) {
-      return true;
-    }
-
-    return protobuf::isTerminalState(state);
-  }
 
   /**
    * Inner class used to namespace the handling of quota requests.
@@ -1283,7 +1362,7 @@ private:
 
     process::Future<std::vector<WeightInfo>> _filterWeights(
         const std::vector<WeightInfo>& weightInfos,
-        const std::list<bool>& roleAuthorizations) const;
+        const std::vector<bool>& roleAuthorizations) const;
 
     process::Future<std::vector<WeightInfo>> _getWeights(
         const Option<process::http::authentication::Principal>&
@@ -1495,25 +1574,25 @@ private:
 
     process::Future<process::http::Response> __updateMaintenanceSchedule(
         const mesos::maintenance::Schedule& schedule,
-        const process::Owned<ObjectApprover>& approver) const;
+        const process::Owned<ObjectApprovers>& approvers) const;
 
     process::Future<process::http::Response> ___updateMaintenanceSchedule(
         const mesos::maintenance::Schedule& schedule,
         bool applied) const;
 
     mesos::maintenance::Schedule _getMaintenanceSchedule(
-        const process::Owned<ObjectApprover>& approver) const;
+        const process::Owned<ObjectApprovers>& approvers) const;
 
     process::Future<mesos::maintenance::ClusterStatus> _getMaintenanceStatus(
-        const process::Owned<ObjectApprover>& approver) const;
+        const process::Owned<ObjectApprovers>& approvers) const;
 
     process::Future<process::http::Response> _startMaintenance(
         const google::protobuf::RepeatedPtrField<MachineID>& machineIds,
-        const process::Owned<ObjectApprover>& approver) const;
+        const process::Owned<ObjectApprovers>& approvers) const;
 
     process::Future<process::http::Response> _stopMaintenance(
         const google::protobuf::RepeatedPtrField<MachineID>& machineIds,
-        const process::Owned<ObjectApprover>& approver) const;
+        const process::Owned<ObjectApprovers>& approvers) const;
 
     process::Future<process::http::Response> _reserve(
         const SlaveID& slaveId,
@@ -1575,7 +1654,7 @@ private:
         ContentType contentType) const;
 
     mesos::master::Response::GetAgents _getAgents(
-        const process::Owned<AuthorizationAcceptor>& rolesAcceptor) const;
+        const process::Owned<ObjectApprovers>& approvers) const;
 
     process::Future<process::http::Response> getFlags(
         const mesos::master::Call& call,
@@ -1647,14 +1726,18 @@ private:
         const Option<process::http::authentication::Principal>& principal,
         ContentType contentType) const;
 
+    process::Future<process::http::Response> getOperations(
+        const mesos::master::Call& call,
+        const Option<process::http::authentication::Principal>& principal,
+        ContentType contentType) const;
+
     process::Future<process::http::Response> getTasks(
         const mesos::master::Call& call,
         const Option<process::http::authentication::Principal>& principal,
         ContentType contentType) const;
 
     mesos::master::Response::GetTasks _getTasks(
-        const process::Owned<ObjectApprover>& frameworksApprover,
-        const process::Owned<ObjectApprover>& tasksApprover) const;
+        const process::Owned<ObjectApprovers>& approvers) const;
 
     process::Future<process::http::Response> createVolumes(
         const mesos::master::Call& call,
@@ -1662,6 +1745,16 @@ private:
         ContentType contentType) const;
 
     process::Future<process::http::Response> destroyVolumes(
+        const mesos::master::Call& call,
+        const Option<process::http::authentication::Principal>& principal,
+        ContentType contentType) const;
+
+    process::Future<process::http::Response> growVolume(
+        const mesos::master::Call& call,
+        const Option<process::http::authentication::Principal>& principal,
+        ContentType contentType) const;
+
+    process::Future<process::http::Response> shrinkVolume(
         const mesos::master::Call& call,
         const Option<process::http::authentication::Principal>& principal,
         ContentType contentType) const;
@@ -1682,7 +1775,7 @@ private:
         ContentType contentType) const;
 
     mesos::master::Response::GetFrameworks _getFrameworks(
-        const process::Owned<ObjectApprover>& frameworksApprover) const;
+        const process::Owned<ObjectApprovers>& approvers) const;
 
     process::Future<process::http::Response> getExecutors(
         const mesos::master::Call& call,
@@ -1690,8 +1783,7 @@ private:
         ContentType contentType) const;
 
     mesos::master::Response::GetExecutors _getExecutors(
-        const process::Owned<ObjectApprover>& frameworksApprover,
-        const process::Owned<ObjectApprover>& executorsApprover) const;
+        const process::Owned<ObjectApprovers>& approvers) const;
 
     process::Future<process::http::Response> getState(
         const mesos::master::Call& call,
@@ -1699,10 +1791,7 @@ private:
         ContentType contentType) const;
 
     mesos::master::Response::GetState _getState(
-        const process::Owned<ObjectApprover>& frameworksApprover,
-        const process::Owned<ObjectApprover>& taskApprover,
-        const process::Owned<ObjectApprover>& executorsApprover,
-        const process::Owned<AuthorizationAcceptor>& rolesAcceptor) const;
+        const process::Owned<ObjectApprovers>& approvers) const;
 
     process::Future<process::http::Response> subscribe(
         const mesos::master::Call& call,
@@ -1727,6 +1816,11 @@ private:
     process::Future<process::http::Response> _markAgentGone(
         const SlaveID& slaveId) const;
 
+    process::Future<process::http::Response> reconcileOperations(
+        Framework* framework,
+        const scheduler::Call::ReconcileOperations& call,
+        ContentType contentType) const;
+
     Master* master;
 
     // NOTE: The quota specific pieces of the Operator API are factored
@@ -1742,6 +1836,7 @@ private:
   Master& operator=(const Master&); // No assigning.
 
   friend struct Framework;
+  friend struct FrameworkMetrics;
   friend struct Metrics;
   friend struct Slave;
   friend struct SlavesWriter;
@@ -1800,13 +1895,13 @@ private:
     Slaves() : removed(MAX_REMOVED_SLAVES) {}
 
     // Imposes a time limit for slaves that we recover from the
-    // registry to re-register with the master.
+    // registry to reregister with the master.
     Option<process::Timer> recoveredTimer;
 
     // Slaves that have been recovered from the registrar after master
     // failover. Slaves are removed from this collection when they
-    // either re-register with the master or are marked unreachable
-    // because they do not re-register before `recoveredTimer` fires.
+    // either reregister with the master or are marked unreachable
+    // because they do not reregister before `recoveredTimer` fires.
     // We must not answer questions related to these slaves (e.g.,
     // during task reconciliation) until we determine their fate
     // because their are in this transitioning state.
@@ -1915,6 +2010,13 @@ private:
     // `registry_max_agent_age`, and `registry_max_agent_count` flags.
     LinkedHashMap<SlaveID, TimeInfo> unreachable;
 
+    // This helps us look up all unreachable tasks on an agent so we can remove
+    // them from their primary storage `framework.unreachableTasks` when an
+    // agent reregisters. This map is bounded by the same GC behavior as
+    // `unreachable`. When the agent is GC'd from unreachable it's also
+    // erased from `unreachableTasks`.
+    hashmap<SlaveID, multihashmap<FrameworkID, TaskID>> unreachableTasks;
+
     // Slaves that have been marked gone. We recover this from the
     // registry, so it includes slaves marked as gone by other instances
     // of the master. Note that we use a LinkedHashMap to ensure the order
@@ -1961,6 +2063,8 @@ private:
 
   struct Subscribers
   {
+    Subscribers(Master* _master) : master(_master) {};
+
     // Represents a client subscribed to the 'api/vX' endpoint.
     //
     // TODO(anand): Add support for filtering. Some subscribers
@@ -1968,11 +2072,9 @@ private:
     struct Subscriber
     {
       Subscriber(
-          Master* _master,
           const HttpConnection& _http,
           const Option<process::http::authentication::Principal> _principal)
-        : master(_master),
-          http(_http),
+        : http(_http),
           principal(_principal)
       {
         mesos::master::Event event;
@@ -1994,11 +2096,13 @@ private:
       Subscriber(const Subscriber&) = delete;
       Subscriber& operator=(const Subscriber&) = delete;
 
-      void send(const mesos::master::Event& event,
-          const process::Owned<AuthorizationAcceptor>& authorizeRole,
-          const process::Owned<AuthorizationAcceptor>& authorizeFramework,
-          const process::Owned<AuthorizationAcceptor>& authorizeTask,
-          const process::Owned<AuthorizationAcceptor>& authorizeExecutor);
+      // TODO(greggomann): Refactor this function into multiple event-specific
+      // overloads. See MESOS-8475.
+      void send(
+          const process::Shared<mesos::master::Event>& event,
+          const process::Owned<ObjectApprovers>& approvers,
+          const process::Shared<FrameworkInfo>& frameworkInfo,
+          const process::Shared<Task>& task);
 
       ~Subscriber()
       {
@@ -2012,7 +2116,6 @@ private:
         wait(heartbeater.get());
       }
 
-      Master* master;
       HttpConnection http;
       process::Owned<Heartbeater<mesos::master::Event, v1::master::Event>>
         heartbeater;
@@ -2020,12 +2123,19 @@ private:
     };
 
     // Sends the event to all subscribers connected to the 'api/vX' endpoint.
-    void send(const mesos::master::Event& event);
+    void send(
+        mesos::master::Event&& event,
+        const Option<FrameworkInfo>& frameworkInfo = None(),
+        const Option<Task>& task = None());
+
+    Master* master;
 
     // Active subscribers to the 'api/vX' endpoint keyed by the stream
     // identifier.
     hashmap<id::UUID, process::Owned<Subscriber>> subscribed;
-  } subscribers;
+  };
+
+  Subscribers subscribers;
 
   hashmap<OfferID, Offer*> offers;
   hashmap<OfferID, process::Timer> offerTimers;
@@ -2075,7 +2185,7 @@ private:
   // copyable metric types only.
   std::shared_ptr<Metrics> metrics;
 
-  // Gauge handlers.
+  // PullGauge handlers.
   double _uptime_secs()
   {
     return (process::Clock::now() - startTime).secs();
@@ -2157,8 +2267,8 @@ struct Framework
   enum State
   {
     // Framework has never connected to this master. This implies the
-    // master failed over and the framework has not yet re-registered,
-    // but some framework state has been recovered from re-registering
+    // master failed over and the framework has not yet reregistered,
+    // but some framework state has been recovered from reregistering
     // agents that are running tasks for the framework.
     RECOVERED,
 
@@ -2178,80 +2288,23 @@ struct Framework
             const Flags& masterFlags,
             const FrameworkInfo& info,
             const process::UPID& _pid,
-            const process::Time& time = process::Clock::now())
-    : Framework(master, masterFlags, info, ACTIVE, time)
-  {
-    pid = _pid;
-  }
+            const process::Time& time = process::Clock::now());
 
   Framework(Master* const master,
             const Flags& masterFlags,
             const FrameworkInfo& info,
             const HttpConnection& _http,
-            const process::Time& time = process::Clock::now())
-    : Framework(master, masterFlags, info, ACTIVE, time)
-  {
-    http = _http;
-  }
+            const process::Time& time = process::Clock::now());
 
   Framework(Master* const master,
             const Flags& masterFlags,
-            const FrameworkInfo& info)
-    : Framework(master, masterFlags, info, RECOVERED, process::Time()) {}
+            const FrameworkInfo& info);
 
-  ~Framework()
-  {
-    if (http.isSome()) {
-      closeHttpConnection();
-    }
-  }
+  ~Framework();
 
-  Task* getTask(const TaskID& taskId)
-  {
-    if (tasks.count(taskId) > 0) {
-      return tasks[taskId];
-    }
+  Task* getTask(const TaskID& taskId);
 
-    return nullptr;
-  }
-
-  void addTask(Task* task)
-  {
-    CHECK(!tasks.contains(task->task_id()))
-      << "Duplicate task " << task->task_id()
-      << " of framework " << task->framework_id();
-
-    // Verify that Resource.AllocationInfo is set,
-    // this should be guaranteed by the master.
-    foreach (const Resource& resource, task->resources()) {
-      CHECK(resource.has_allocation_info());
-    }
-
-    tasks[task->task_id()] = task;
-
-    if (!Master::isRemovable(task->state())) {
-      // Note that we explicitly convert from protobuf to `Resources` once
-      // and then use the result for calculations to avoid performance penalty
-      // for multiple conversions and validations implied by `+=` with protobuf
-      // arguments.
-      // Conversion is safe, as resources have already passed validation.
-      const Resources resources = task->resources();
-      totalUsedResources += resources;
-      usedResources[task->slave_id()] += resources;
-
-      // It's possible that we're not tracking the task's role for
-      // this framework if the role is absent from the framework's
-      // set of roles. In this case, we track the role's allocation
-      // for this framework.
-      CHECK(!task->resources().empty());
-      const std::string& role =
-        task->resources().begin()->allocation_info().role();
-
-      if (!isTrackedUnderRole(role)) {
-        trackUnderRole(role);
-      }
-    }
-  }
+  void addTask(Task* task);
 
   // Update framework to recover the resources that were previously
   // being used by `task`.
@@ -2259,519 +2312,75 @@ struct Framework
   // TODO(bmahler): This is a hack for performance. We need to
   // maintain resource counters because computing task resources
   // functionally for all tasks is expensive, for now.
-  void recoverResources(Task* task)
-  {
-    CHECK(tasks.contains(task->task_id()))
-      << "Unknown task " << task->task_id()
-      << " of framework " << task->framework_id();
-
-    totalUsedResources -= task->resources();
-    usedResources[task->slave_id()] -= task->resources();
-    if (usedResources[task->slave_id()].empty()) {
-      usedResources.erase(task->slave_id());
-    }
-
-    // If we are no longer subscribed to the role to which these resources are
-    // being returned to, and we have no more resources allocated to us for that
-    // role, stop tracking the framework under the role.
-    CHECK(!task->resources().empty());
-    const std::string& role =
-      task->resources().begin()->allocation_info().role();
-
-    auto allocatedToRole = [&role](const Resource& resource) {
-      return resource.allocation_info().role() == role;
-    };
-
-    if (roles.count(role) == 0 &&
-        totalUsedResources.filter(allocatedToRole).empty()) {
-      CHECK(totalOfferedResources.filter(allocatedToRole).empty());
-      untrackUnderRole(role);
-    }
-  }
+  void recoverResources(Task* task);
 
   // Sends a message to the connected framework.
   template <typename Message>
-  void send(const Message& message)
-  {
-    if (!connected()) {
-      LOG(WARNING) << "Master attempted to send message to disconnected"
-                   << " framework " << *this;
-    }
+  void send(const Message& message);
 
-    if (http.isSome()) {
-      if (!http.get().send(message)) {
-        LOG(WARNING) << "Unable to send event to framework " << *this << ":"
-                     << " connection closed";
-      }
-    } else {
-      CHECK_SOME(pid);
-      master->send(pid.get(), message);
-    }
-  }
+  void addCompletedTask(Task&& task);
 
-  void addCompletedTask(Task&& task)
-  {
-    // TODO(neilc): We currently allow frameworks to reuse the task
-    // IDs of completed tasks (although this is discouraged). This
-    // means that there might be multiple completed tasks with the
-    // same task ID. We should consider rejecting attempts to reuse
-    // task IDs (MESOS-6779).
-    completedTasks.push_back(process::Owned<Task>(new Task(std::move(task))));
-  }
-
-  void addUnreachableTask(const Task& task)
-  {
-    // TODO(adam-mesos): Check if unreachable task already exists.
-    unreachableTasks.set(task.task_id(), process::Owned<Task>(new Task(task)));
-  }
+  void addUnreachableTask(const Task& task);
 
   // Removes the task. `unreachable` indicates whether the task is removed due
   // to being unreachable. Note that we cannot rely on the task state because
   // it may not reflect unreachability due to being set to TASK_LOST for
   // backwards compatibility.
-  void removeTask(Task* task, bool unreachable)
-  {
-    CHECK(tasks.contains(task->task_id()))
-      << "Unknown task " << task->task_id()
-      << " of framework " << task->framework_id();
+  void removeTask(Task* task, bool unreachable);
 
-    if (!Master::isRemovable(task->state())) {
-      recoverResources(task);
-    }
+  void addOffer(Offer* offer);
 
-    if (unreachable) {
-      addUnreachableTask(*task);
-    } else {
-      addCompletedTask(Task(*task));
-    }
+  void removeOffer(Offer* offer);
 
-    tasks.erase(task->task_id());
-  }
+  void addInverseOffer(InverseOffer* inverseOffer);
 
-  void addOffer(Offer* offer)
-  {
-    CHECK(!offers.contains(offer)) << "Duplicate offer " << offer->id();
-    offers.insert(offer);
-    totalOfferedResources += offer->resources();
-    offeredResources[offer->slave_id()] += offer->resources();
-  }
-
-  void removeOffer(Offer* offer)
-  {
-    CHECK(offers.find(offer) != offers.end())
-      << "Unknown offer " << offer->id();
-
-    totalOfferedResources -= offer->resources();
-    offeredResources[offer->slave_id()] -= offer->resources();
-    if (offeredResources[offer->slave_id()].empty()) {
-      offeredResources.erase(offer->slave_id());
-    }
-
-    offers.erase(offer);
-  }
-
-  void addInverseOffer(InverseOffer* inverseOffer)
-  {
-    CHECK(!inverseOffers.contains(inverseOffer))
-      << "Duplicate inverse offer " << inverseOffer->id();
-    inverseOffers.insert(inverseOffer);
-  }
-
-  void removeInverseOffer(InverseOffer* inverseOffer)
-  {
-    CHECK(inverseOffers.contains(inverseOffer))
-      << "Unknown inverse offer " << inverseOffer->id();
-
-    inverseOffers.erase(inverseOffer);
-  }
+  void removeInverseOffer(InverseOffer* inverseOffer);
 
   bool hasExecutor(const SlaveID& slaveId,
-                   const ExecutorID& executorId)
-  {
-    return executors.contains(slaveId) &&
-      executors[slaveId].contains(executorId);
-  }
+                   const ExecutorID& executorId);
 
   void addExecutor(const SlaveID& slaveId,
-                   const ExecutorInfo& executorInfo)
-  {
-    CHECK(!hasExecutor(slaveId, executorInfo.executor_id()))
-      << "Duplicate executor '" << executorInfo.executor_id()
-      << "' on agent " << slaveId;
-
-    // Verify that Resource.AllocationInfo is set,
-    // this should be guaranteed by the master.
-    foreach (const Resource& resource, executorInfo.resources()) {
-      CHECK(resource.has_allocation_info());
-    }
-
-    executors[slaveId][executorInfo.executor_id()] = executorInfo;
-    totalUsedResources += executorInfo.resources();
-    usedResources[slaveId] += executorInfo.resources();
-
-    // It's possible that we're not tracking the task's role for
-    // this framework if the role is absent from the framework's
-    // set of roles. In this case, we track the role's allocation
-    // for this framework.
-    if (!executorInfo.resources().empty()) {
-      const std::string& role =
-        executorInfo.resources().begin()->allocation_info().role();
-
-      if (!isTrackedUnderRole(role)) {
-        trackUnderRole(role);
-      }
-    }
-  }
+                   const ExecutorInfo& executorInfo);
 
   void removeExecutor(const SlaveID& slaveId,
-                      const ExecutorID& executorId)
-  {
-    CHECK(hasExecutor(slaveId, executorId))
-      << "Unknown executor '" << executorId
-      << "' of framework " << id()
-      << " of agent " << slaveId;
+                      const ExecutorID& executorId);
 
-    const ExecutorInfo& executorInfo = executors[slaveId][executorId];
+  void addOperation(Operation* operation);
 
-    totalUsedResources -= executorInfo.resources();
-    usedResources[slaveId] -= executorInfo.resources();
-    if (usedResources[slaveId].empty()) {
-      usedResources.erase(slaveId);
-    }
+  Option<Operation*> getOperation(const OperationID& id);
 
-    // If we are no longer subscribed to the role to which these resources are
-    // being returned to, and we have no more resources allocated to us for that
-    // role, stop tracking the framework under the role.
-    if (!executorInfo.resources().empty()) {
-      const std::string& role =
-        executorInfo.resources().begin()->allocation_info().role();
+  void recoverResources(Operation* operation);
 
-      auto allocatedToRole = [&role](const Resource& resource) {
-        return resource.allocation_info().role() == role;
-      };
+  void removeOperation(Operation* operation);
 
-      if (roles.count(role) == 0 &&
-          totalUsedResources.filter(allocatedToRole).empty()) {
-        CHECK(totalOfferedResources.filter(allocatedToRole).empty());
-        untrackUnderRole(role);
-      }
-    }
-
-    executors[slaveId].erase(executorId);
-    if (executors[slaveId].empty()) {
-      executors.erase(slaveId);
-    }
-  }
-
-  void addOperation(Operation* operation)
-  {
-    CHECK(operation->has_framework_id());
-
-    const FrameworkID& frameworkId = operation->framework_id();
-
-    Try<id::UUID> uuid = id::UUID::fromBytes(operation->uuid().value());
-    CHECK_SOME(uuid);
-
-    CHECK(!operations.contains(uuid.get()))
-      << "Duplicate operation '" << operation->info().id()
-      << "' (uuid: " << uuid->toString() << ") "
-      << "of framework " << frameworkId;
-
-    operations.put(uuid.get(), operation);
-
-    if (operation->info().has_id()) {
-      operationUUIDs.put(operation->info().id(), uuid.get());
-    }
-
-    if (!protobuf::isSpeculativeOperation(operation->info()) &&
-        !protobuf::isTerminalState(operation->latest_status().state())) {
-      Try<Resources> consumed =
-        protobuf::getConsumedResources(operation->info());
-      CHECK_SOME(consumed);
-
-      CHECK(operation->has_slave_id())
-        << "External resource provider is not supported yet";
-
-      const SlaveID& slaveId = operation->slave_id();
-
-      totalUsedResources += consumed.get();
-      usedResources[slaveId] += consumed.get();
-
-      // It's possible that we're not tracking the role from the
-      // resources in the operation for this framework if the role is
-      // absent from the framework's set of roles. In this case, we
-      // track the role's allocation for this framework.
-      foreachkey (const std::string& role, consumed->allocations()) {
-        if (!isTrackedUnderRole(role)) {
-          trackUnderRole(role);
-        }
-      }
-    }
-  }
-
-  void recoverResources(Operation* operation)
-  {
-    CHECK(operation->has_slave_id())
-      << "External resource provider is not supported yet";
-
-    const SlaveID& slaveId = operation->slave_id();
-
-    if (protobuf::isSpeculativeOperation(operation->info())) {
-      return;
-    }
-
-    Try<Resources> consumed = protobuf::getConsumedResources(operation->info());
-    CHECK_SOME(consumed);
-
-    CHECK(totalUsedResources.contains(consumed.get()))
-      << "Tried to recover resources " << consumed.get()
-      << " which do not seem used";
-
-    CHECK(usedResources[slaveId].contains(consumed.get()))
-      << "Tried to recover resources " << consumed.get() << " of agent "
-      << slaveId << " which do not seem used";
-
-    totalUsedResources -= consumed.get();
-    usedResources[slaveId] -= consumed.get();
-    if (usedResources[slaveId].empty()) {
-      usedResources.erase(slaveId);
-    }
-
-    // If we are no longer subscribed to the role to which these
-    // resources are being returned to, and we have no more resources
-    // allocated to us for that role, stop tracking the framework
-    // under the role.
-    foreachkey (const std::string& role, consumed->allocations()) {
-      auto allocatedToRole = [&role](const Resource& resource) {
-        return resource.allocation_info().role() == role;
-      };
-
-      if (roles.count(role) == 0 &&
-          totalUsedResources.filter(allocatedToRole).empty()) {
-        CHECK(totalOfferedResources.filter(allocatedToRole).empty());
-        untrackUnderRole(role);
-      }
-    }
-  }
-
-  void removeOperation(Operation* operation)
-  {
-    Try<id::UUID> uuid = id::UUID::fromBytes(operation->uuid().value());
-    CHECK_SOME(uuid);
-
-    CHECK(operations.contains(uuid.get()))
-      << "Unknown operation '" << operation->info().id()
-      << "' (uuid: " << uuid->toString() << ") "
-      << "of framework " << operation->framework_id();
-
-    if (!protobuf::isSpeculativeOperation(operation->info()) &&
-        !protobuf::isTerminalState(operation->latest_status().state())) {
-      recoverResources(operation);
-    }
-
-    operations.erase(uuid.get());
-  }
-
-  const FrameworkID id() const { return info.id(); }
+  const FrameworkID id() const;
 
   // Update fields in 'info' using those in 'newInfo'. Currently this
   // only updates `role`/`roles`, 'name', 'failover_timeout', 'hostname',
   // 'webui_url', 'capabilities', and 'labels'.
-  void update(const FrameworkInfo& newInfo)
-  {
-    // We only merge 'info' from the same framework 'id'.
-    CHECK_EQ(info.id(), newInfo.id());
+  void update(const FrameworkInfo& newInfo);
 
-    // Save the old list of roles for later.
-    std::set<std::string> oldRoles = roles;
+  void updateConnection(const process::UPID& newPid);
 
-    // TODO(jmlvanre): Merge other fields as per design doc in
-    // MESOS-703.
-
-    info.clear_role();
-    info.clear_roles();
-
-    if (newInfo.has_role()) {
-      info.set_role(newInfo.role());
-    }
-
-    if (newInfo.roles_size() > 0) {
-      info.mutable_roles()->CopyFrom(newInfo.roles());
-    }
-
-    roles = protobuf::framework::getRoles(newInfo);
-
-    if (newInfo.user() != info.user()) {
-      LOG(WARNING) << "Cannot update FrameworkInfo.user to '" << newInfo.user()
-                   << "' for framework " << id() << ". Check MESOS-703";
-    }
-
-    info.set_name(newInfo.name());
-
-    if (newInfo.has_failover_timeout()) {
-      info.set_failover_timeout(newInfo.failover_timeout());
-    } else {
-      info.clear_failover_timeout();
-    }
-
-    if (newInfo.checkpoint() != info.checkpoint()) {
-      LOG(WARNING) << "Cannot update FrameworkInfo.checkpoint to '"
-                   << stringify(newInfo.checkpoint()) << "' for framework "
-                   << id() << ". Check MESOS-703";
-    }
-
-    if (newInfo.has_hostname()) {
-      info.set_hostname(newInfo.hostname());
-    } else {
-      info.clear_hostname();
-    }
-
-    if (newInfo.principal() != info.principal()) {
-      LOG(WARNING) << "Cannot update FrameworkInfo.principal to '"
-                   << newInfo.principal() << "' for framework " << id()
-                   << ". Check MESOS-703";
-    }
-
-    if (newInfo.has_webui_url()) {
-      info.set_webui_url(newInfo.webui_url());
-    } else {
-      info.clear_webui_url();
-    }
-
-    if (newInfo.capabilities_size() > 0) {
-      info.mutable_capabilities()->CopyFrom(newInfo.capabilities());
-    } else {
-      info.clear_capabilities();
-    }
-    capabilities = protobuf::framework::Capabilities(info.capabilities());
-
-    if (newInfo.has_labels()) {
-      info.mutable_labels()->CopyFrom(newInfo.labels());
-    } else {
-      info.clear_labels();
-    }
-
-    const std::set<std::string>& newRoles = roles;
-
-    const std::set<std::string> removedRoles = [&]() {
-      std::set<std::string> result = oldRoles;
-      foreach (const std::string& role, newRoles) {
-        result.erase(role);
-      }
-      return result;
-    }();
-
-    foreach (const std::string& role, removedRoles) {
-      auto allocatedToRole = [&role](const Resource& resource) {
-        return resource.allocation_info().role() == role;
-      };
-
-      // Stop tracking the framework under this role if there are
-      // no longer any resources allocated to it.
-      if (totalUsedResources.filter(allocatedToRole).empty()) {
-        CHECK(totalOfferedResources.filter(allocatedToRole).empty());
-        untrackUnderRole(role);
-      }
-    }
-
-    const std::set<std::string> addedRoles = [&]() {
-      std::set<std::string> result = newRoles;
-      foreach (const std::string& role, oldRoles) {
-        result.erase(role);
-      }
-      return result;
-    }();
-
-    foreach (const std::string& role, addedRoles) {
-      // NOTE: It's possible that we're already tracking this framework
-      // under the role because a framework can unsubscribe from a role
-      // while it still has resources allocated to the role.
-      if (!isTrackedUnderRole(role)) {
-        trackUnderRole(role);
-      }
-    }
-  }
-
-  void updateConnection(const process::UPID& newPid)
-  {
-    // Cleanup the HTTP connnection if this is a downgrade from HTTP
-    // to PID. Note that the connection may already be closed.
-    if (http.isSome()) {
-      closeHttpConnection();
-    }
-
-    // TODO(benh): unlink(oldPid);
-    pid = newPid;
-  }
-
-  void updateConnection(const HttpConnection& newHttp)
-  {
-    if (pid.isSome()) {
-      // Wipe the PID if this is an upgrade from PID to HTTP.
-      // TODO(benh): unlink(oldPid);
-      pid = None();
-    } else if (http.isSome()) {
-      // Cleanup the old HTTP connection.
-      // Note that master creates a new HTTP connection for every
-      // subscribe request, so 'newHttp' should always be different
-      // from 'http'.
-      closeHttpConnection();
-    }
-
-    CHECK_NONE(http);
-
-    http = newHttp;
-  }
+  void updateConnection(const HttpConnection& newHttp);
 
   // Closes the HTTP connection and stops the heartbeat.
   //
   // TODO(vinod): Currently `state` variable is set separately
   // from this method. We need to make sure these are in sync.
-  void closeHttpConnection()
-  {
-    CHECK_SOME(http);
+  void closeHttpConnection();
 
-    if (connected() && !http.get().close()) {
-      LOG(WARNING) << "Failed to close HTTP pipe for " << *this;
-    }
+  void heartbeat();
 
-    http = None();
-
-    CHECK_SOME(heartbeater);
-
-    terminate(heartbeater.get().get());
-    wait(heartbeater.get().get());
-
-    heartbeater = None();
-  }
-
-  void heartbeat()
-  {
-    CHECK_NONE(heartbeater);
-    CHECK_SOME(http);
-
-    // TODO(vinod): Make heartbeat interval configurable and include
-    // this information in the SUBSCRIBED response.
-    scheduler::Event event;
-    event.set_type(scheduler::Event::HEARTBEAT);
-
-    heartbeater =
-      new Heartbeater<scheduler::Event, v1::scheduler::Event>(
-          "framework " + stringify(info.id()),
-          event,
-          http.get(),
-          DEFAULT_HEARTBEAT_INTERVAL);
-
-    process::spawn(heartbeater.get().get());
-  }
-
-  bool active() const    { return state == ACTIVE; }
-  bool connected() const { return state == ACTIVE || state == INACTIVE; }
-  bool recovered() const { return state == RECOVERED; }
+  bool active() const;
+  bool connected() const;
+  bool recovered() const;
 
   bool isTrackedUnderRole(const std::string& role) const;
   void trackUnderRole(const std::string& role);
   void untrackUnderRole(const std::string& role);
+
+  void setFrameworkState(const State& _state);
 
   Master* const master;
 
@@ -2826,11 +2435,11 @@ struct Framework
 
   // Pending operations or terminal operations that have
   // unacknowledged status updates.
-  hashmap<id::UUID, Operation*> operations;
+  hashmap<UUID, Operation*> operations;
 
   // The map from the framework-specified operation ID to the
   // corresponding internal operation UUID.
-  hashmap<OperationID, id::UUID> operationUUIDs;
+  hashmap<OperationID, UUID> operationUUIDs;
 
   // NOTE: For the used and offered resources below, we keep the
   // total as well as partitioned by SlaveID.
@@ -2869,35 +2478,70 @@ struct Framework
   Option<process::Owned<Heartbeater<scheduler::Event, v1::scheduler::Event>>>
     heartbeater;
 
+  // This is used for per-framwork metrics.
+  FrameworkMetrics metrics;
+
 private:
   Framework(Master* const _master,
             const Flags& masterFlags,
             const FrameworkInfo& _info,
             State state,
-            const process::Time& time)
-    : master(_master),
-      info(_info),
-      roles(protobuf::framework::getRoles(_info)),
-      capabilities(_info.capabilities()),
-      state(state),
-      registeredTime(time),
-      reregisteredTime(time),
-      completedTasks(masterFlags.max_completed_tasks_per_framework),
-      unreachableTasks(masterFlags.max_unreachable_tasks_per_framework)
-  {
-    foreach (const std::string& role, roles) {
-      // NOTE: It's possible that we're already being tracked under the role
-      // because a framework can unsubscribe from a role while it still has
-      // resources allocated to the role.
-      if (!isTrackedUnderRole(role)) {
-        trackUnderRole(role);
-      }
-    }
-  }
+            const process::Time& time);
 
   Framework(const Framework&);              // No copying.
   Framework& operator=(const Framework&); // No assigning.
 };
+
+
+// Sends a message to the connected framework.
+template <typename Message>
+void Framework::send(const Message& message)
+{
+  if (!connected()) {
+    LOG(WARNING) << "Master attempted to send message to disconnected"
+                 << " framework " << *this;
+  }
+
+  // TODO(gilbert): add a helper to transform `SchedulerDriver` API messages
+  // directly to v0 events.
+  metrics.incrementEvent(devolve(evolve(message)));
+
+  if (http.isSome()) {
+    if (!http->send(message)) {
+      LOG(WARNING) << "Unable to send event to framework " << *this << ":"
+                   << " connection closed";
+    }
+  } else {
+    CHECK_SOME(pid);
+    master->send(pid.get(), message);
+  }
+}
+
+
+// TODO(bevers): Check if there is anything preventing us from
+// returning a const reference here.
+inline const FrameworkID Framework::id() const
+{
+  return info.id();
+}
+
+
+inline bool Framework::active() const
+{
+  return state == ACTIVE;
+}
+
+
+inline bool Framework::connected() const
+{
+  return state == ACTIVE || state == INACTIVE;
+}
+
+
+inline bool Framework::recovered() const
+{
+  return state == RECOVERED;
+}
 
 
 inline std::ostream& operator<<(

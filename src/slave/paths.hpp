@@ -22,6 +22,7 @@
 
 #include <mesos/mesos.hpp>
 
+#include <stout/nothing.hpp>
 #include <stout/try.hpp>
 #include <stout/uuid.hpp>
 
@@ -391,7 +392,7 @@ std::string getPersistentVolumePath(
     const Resource& resource);
 
 
-std::string createExecutorDirectory(
+Try<std::string> createExecutorDirectory(
     const std::string& rootDir,
     const SlaveID& slaveId,
     const FrameworkID& frameworkId,

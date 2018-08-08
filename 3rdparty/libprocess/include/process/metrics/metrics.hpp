@@ -15,6 +15,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
@@ -24,7 +25,6 @@
 
 #include <process/metrics/metric.hpp>
 
-#include <stout/hashmap.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
 
@@ -45,7 +45,7 @@ public:
       const Option<Duration>& timeout);
 
 protected:
-  virtual void initialize();
+  void initialize() override;
 
 private:
   static std::string help();
@@ -66,16 +66,16 @@ private:
       const http::Request& request,
       const Option<http::authentication::Principal>&);
 
-  static std::list<Future<double>> _snapshotTimeout(
-      const std::list<Future<double>>& futures);
-
-  static Future<std::map<std::string, double>> __snapshot(
+  // TODO(bmahler): Make this static once we can move
+  // capture with C++14.
+  Future<std::map<std::string, double>> __snapshot(
       const Option<Duration>& timeout,
-      const hashmap<std::string, Future<double>>& metrics,
-      const hashmap<std::string, Option<Statistics<double>>>& statistics);
+      std::vector<std::string>&& keys,
+      std::vector<Future<double>>&& metrics,
+      std::vector<Option<Statistics<double>>>&& statistics);
 
   // The Owned<Metric> is an explicit copy of the Metric passed to 'add'.
-  hashmap<std::string, Owned<Metric>> metrics;
+  std::map<std::string, Owned<Metric>> metrics;
 
   // Used to rate limit the snapshot endpoint.
   Option<Owned<RateLimiter>> limiter;

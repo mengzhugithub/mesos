@@ -36,6 +36,8 @@
 
 #include "common/validation.hpp"
 
+#include "csi/paths.hpp"
+
 #include "messages/messages.hpp"
 
 #include "slave/paths.hpp"
@@ -673,10 +675,18 @@ string getPersistentVolumePath(
       CHECK(volume.disk().source().has_path());
       CHECK(volume.disk().source().path().has_root());
       string root = volume.disk().source().path().root();
+
       if (!path::absolute(root)) {
         // A relative path in `root` is relative to agent work dir.
         root = path::join(workDir, root);
       }
+
+      if (volume.disk().source().has_id()) {
+        // For a CSI volume the mount point is derived from `root` and `id`.
+        root =
+          csi::paths::getMountTargetPath(root, volume.disk().source().id());
+      }
+
       return getPersistentVolumePath(
           root,
           role,
@@ -687,10 +697,18 @@ string getPersistentVolumePath(
       CHECK(volume.disk().source().has_mount());
       CHECK(volume.disk().source().mount().has_root());
       string root = volume.disk().source().mount().root();
+
       if (!path::absolute(root)) {
         // A relative path in `root` is relative to agent work dir.
         root = path::join(workDir, root);
       }
+
+      if (volume.disk().source().has_id()) {
+        // For a CSI volume the mount point is derived from `root` and `id`.
+        root =
+          csi::paths::getMountTargetPath(root, volume.disk().source().id());
+      }
+
       return root;
     }
     case Resource::DiskInfo::Source::BLOCK:
@@ -704,7 +722,7 @@ string getPersistentVolumePath(
 }
 
 
-string createExecutorDirectory(
+Try<string> createExecutorDirectory(
     const string& rootDir,
     const SlaveID& slaveId,
     const FrameworkID& frameworkId,
@@ -731,9 +749,11 @@ string createExecutorDirectory(
   }
 
   Try<Nothing> mkdir = createSandboxDirectory(directory, user);
-
-  CHECK_SOME(mkdir)
-    << "Failed to create executor directory '" << directory << "'";
+  if (mkdir.isError()) {
+    return Error(
+        "Failed to create executor directory '" + directory + "': " +
+        mkdir.error());
+  }
 
   // Remove the previous "latest" symlink.
   const string latest =
@@ -746,10 +766,11 @@ string createExecutorDirectory(
 
   // Symlink the new executor directory to "latest".
   Try<Nothing> symlink = ::fs::symlink(directory, latest);
-
-  CHECK_SOME(symlink)
-    << "Failed to symlink directory '" << directory
-    << "' to '" << latest << "'";
+  if (symlink.isError()) {
+    return Error(
+        "Failed to symlink '" + directory + "' to '" + latest + "': " +
+        symlink.error());
+  }
 
   return directory;
 }

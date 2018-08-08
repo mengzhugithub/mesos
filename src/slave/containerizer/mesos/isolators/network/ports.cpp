@@ -343,6 +343,7 @@ Try<Isolator*> NetworkPortsIsolatorProcess::create(const Flags& flags)
       new NetworkPortsIsolatorProcess(
           strings::contains(flags.isolation, "network/cni"),
           flags.container_ports_watch_interval,
+          flags.enforce_container_ports,
           flags.cgroups_root,
           freezerHierarchy.get(),
           agentPorts)));
@@ -352,12 +353,14 @@ Try<Isolator*> NetworkPortsIsolatorProcess::create(const Flags& flags)
 NetworkPortsIsolatorProcess::NetworkPortsIsolatorProcess(
     bool _cniIsolatorEnabled,
     const Duration& _watchInterval,
+    const bool& _enforceContainerPorts,
     const string& _cgroupsRoot,
     const string& _freezerHierarchy,
     const Option<IntervalSet<uint16_t>>& _agentPorts)
   : ProcessBase(process::ID::generate("network-ports-isolator")),
     cniIsolatorEnabled(_cniIsolatorEnabled),
     watchInterval(_watchInterval),
+    enforceContainerPorts(_enforceContainerPorts),
     cgroupsRoot(_cgroupsRoot),
     freezerHierarchy(_freezerHierarchy),
     agentPorts(_agentPorts)
@@ -394,7 +397,7 @@ static bool hasNamedNetwork(const ContainerInfo& container_info)
 // so we must not start isolating it until we receive the resources
 // update.
 Future<Nothing> NetworkPortsIsolatorProcess::recover(
-    const list<ContainerState>& states,
+    const vector<ContainerState>& states,
     const hashset<ContainerID>& orphans)
 {
   // First, recover all the root level containers.
@@ -522,12 +525,13 @@ Future<Nothing> NetworkPortsIsolatorProcess::update(
   Option<Value::Ranges> ports = resources.ports();
   if (ports.isSome()) {
     const Owned<Info>& info = infos.at(containerId);
-    info->ports = rangesToIntervalSet<uint16_t>(ports.get()).get();
+    info->allocatedPorts = rangesToIntervalSet<uint16_t>(ports.get()).get();
   } else {
-    info->ports = IntervalSet<uint16_t>();
+    info->allocatedPorts = IntervalSet<uint16_t>();
   }
 
-  LOG(INFO) << "Updated ports to " << intervalSetToRanges(info->ports.get())
+  LOG(INFO) << "Updated ports to "
+            << intervalSetToRanges(info->allocatedPorts.get())
             << " for container " << containerId;
 
   return Nothing();
@@ -568,8 +572,20 @@ Future<Nothing> NetworkPortsIsolatorProcess::check(
     // for this container.
     const Owned<Info>& info = infos.at(rootContainerId);
 
-    if (info->ports.isSome() && !info->ports->contains(ports)) {
-      const IntervalSet<uint16_t> unallocatedPorts = ports - info->ports.get();
+    if (info->allocatedPorts.isSome() &&
+        !info->allocatedPorts->contains(ports)) {
+      const IntervalSet<uint16_t> unallocatedPorts =
+          ports - info->allocatedPorts.get();
+
+      // Only log unallocated ports once to prevent excessive logging
+      // for the same unallocated ports while port enforcement is disabled.
+      if (info->activePorts.isSome() && info->activePorts == ports) {
+        continue;
+      }
+
+      // Cache the last listeners port sample so that we will
+      // only log new ports resource violations.
+      info->activePorts = ports;
 
       Resource resource;
       resource.set_name("ports");
@@ -584,11 +600,13 @@ Future<Nothing> NetworkPortsIsolatorProcess::check(
 
       LOG(INFO) << message;
 
-      info->limitation.set(
-          protobuf::slave::createContainerLimitation(
-              Resources(resource),
-              message,
-              TaskStatus::REASON_CONTAINER_LIMITATION));
+      if (enforceContainerPorts) {
+        info->limitation.set(
+        protobuf::slave::createContainerLimitation(
+            Resources(resource),
+            message,
+            TaskStatus::REASON_CONTAINER_LIMITATION));
+      }
     }
   }
 

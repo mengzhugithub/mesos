@@ -8,7 +8,9 @@ layout: documentation
 This document describes the [Container Storage Interface](https://github.com/container-storage-interface/spec)
 (CSI) support in Mesos.
 
-Currently, only CSI spec version 0.1 is supported.
+Currently, only CSI spec version 0.2 is supported in Mesos 1.6+ due to
+incompatible changes between CSI version 0.1 and version 0.2. CSI version 0.1 is
+supported in Mesos 1.5.
 
 ## Motivation
 
@@ -59,35 +61,13 @@ The following figure provides an overview about how Mesos supports CSI.
 
 ![CSI Architecture](images/csi-architecture.png)
 
-### Resource Providers
-
-[Resource Provider](resource-provider.md) is a new abstraction introduced in
-Mesos 1.5. Leveraging this, the resource-providing part of Mesos can be easily
-extended and customized. Before 1.5, this part of the logic is hard-coded in the
-agent. Resource providers are mainly responsible for updating Mesos about
-available resources and handling operations on those resources.
-
-There are two types of resource providers: Local Resource Providers (LRP) and
-External Resource Providers (ERP). Local resource providers only provide
-resources that are tied to a particular agent node, while external resource
-providers provide resources that are not tied to any agent node (a.k.a. global
-resources). The resource provider API is designed in such a way that it works
-for both types of resource providers. In Mesos 1.5, only local resource
-providers are supported.
-
-The resource provider API is an HTTP-based API, allowing resource providers to
-be running outside the Mesos master or agent. This is important for ERPs.
-
-There is a component in the agent, called the Resource Provider Manager, that
-monitors and manages LRPs on that agent. The same component will be running in
-the master in the future to monitor ERPs.
-
 ### First Class Storage Resource Provider
 
-The resource provider abstraction is a natural fit for supporting storage and
-CSI.  Since CSI standardizes the interface between container orchestrators and
-storage vendors, the implementation for the storage resource provider should be
-the same for all storage systems that are CSI-compatible.
+The [resource provider](resource-provider.md) abstraction is a natural fit for
+supporting storage and CSI. Since CSI standardizes the interface between
+container orchestrators and storage vendors, the implementation for the storage
+resource provider should be the same for all storage systems that are
+CSI-compatible.
 
 As a result, Mesos provides a default implementation of LRP, called Storage
 Local Resource Provider (SLRP), to provide general support for storage and CSI.
@@ -177,7 +157,7 @@ message Resource {
   from a CSI plugin. This field must not be set by frameworks.
 * `metadata`: This maps to CSI [Volume Attributes](https://github.com/container-storage-interface/spec/blob/v0.1.0/spec.md#createvolume)
   if the disk resource is backed by a [Volume](https://github.com/container-storage-interface/spec/blob/v0.1.0/spec.md#terminology)
-  from a CSI plugin. This field must not be set by framweworks.
+  from a CSI plugin. This field must not be set by frameworks.
 
 ### Storage Pool
 
@@ -200,8 +180,7 @@ a [pre-existing disk](#pre-existing-disks).  Pre-existing disks are those
 [CSI Volumes](https://github.com/container-storage-interface/spec/blob/v0.1.0/spec.md#terminology)
 that are detected by the corresponding CSI plugin using the
 [`ListVolumes` interface](https://github.com/container-storage-interface/spec/blob/v0.1.0/spec.md#listvolumes),
-but have not gone through the dynamic provisioning process (i.e., via
-`CREATE_VOLUME` or `CREATE_BLOCK`).
+but have not gone through the dynamic provisioning process (i.e., via `CREATE_DISK`).
 
 For example, operators might pre-create some LVM logical volumes before
 launching Mesos. Those pre-created LVM logical volumes will be reported by the
@@ -213,14 +192,14 @@ in the near future. See more details in the [profiles](#profiles) section.
 
 ### New Offer Operations for Disk Resources
 
-To allow dynamic provisioning of disk resources, 4 new offer operations have
+To allow dynamic provisioning of disk resources, two new offer operations have
 been added to the [scheduler API](scheduler-http-api.md#accept):
-`CREATE_VOLUME`, `DESTROY_VOLUME`, `CREATE_BLOCK` and `DESTROY_BLOCK`.
+`CREATE_DISK` and `DESTROY_DISK`.
 
 To learn how to use the offer operations, please refer to the
 [`ACCEPT`](scheduler-http-api.md#accept) Call in the v1 scheduler API, or
-[`acceptOffers`](app-framework-development-guide.md#scheduler-driver-api) method
-in the v0 scheduler API for more details.
+[`acceptOffers`](app-framework-development-guide.md#api) method in the v0
+scheduler API for more details.
 
 ```protobuf
 message Offer {
@@ -233,71 +212,72 @@ message Offer {
       UNRESERVE = 3;
       CREATE = 4;
       DESTROY = 5;
-      CREATE_VOLUME = 7;   // New in 1.5.
-      DESTROY_VOLUME = 8;  // New in 1.5.
-      CREATE_BLOCK = 9;    // New in 1.5.
-      DESTROY_BLOCK = 10;  // New in 1.5.
+      GROW_VOLUME = 11;
+      SHRINK_VOLUME = 12;
+      CREATE_DISK = 13;   // New in 1.7.
+      DESTROY_DISK = 14;  // New in 1.7.
     }
     optional Type type = 1;
   }
 }
 ```
 
-#### `CREATE_VOLUME` operation
+#### `CREATE_DISK` operation
 
-The offer operation `CREATE_VOLUME` takes a `RAW` disk resource
-(`create_volume.source`), and converts it into either a `PATH` or a `MOUNT` disk
-resource (`create_volume.target_type`). The source `RAW` disk resource can
+The offer operation `CREATE_DISK` takes a `RAW` disk resource
+(`create_disk.source`), and create a `MOUNT` or a `BLOCK` disk resource
+(`create_disk.target_type`) from the source. The source `RAW` disk resource can
 either be a storage pool (i.e., a `RAW` disk resource without an ID) or a
 pre-existing disk (i.e., a `RAW` disk resource with an ID). The quantity of the
-converted resource (either `PATH` or `MOUNT` disk resource) will be the same as
+converted resource (either `MOUNT` or `BLOCK` disk resource) will be the same as
 the source `RAW` resource.
 
 ```protobuf
 message Offer {
   message Operation {
-    message CreateVolume {
+    message CreateDisk {
       required Resource source = 1;
       required Resource.DiskInfo.Source.Type target_type = 2;
     }
-    optional CreateVolume create_volume = 8;
+    optional CreateDisk create_disk = 15;
   }
 }
 ```
 
-The converted disk resource will have the disk [`id` and `metadata`](#disk-id-and-metadata)
+The created disk resource will have the disk [`id` and `metadata`](#disk-id-and-metadata)
 set accordingly to uniquely identify the volume reported by the CSI plugin.
 
-Note that `CREATE_VOLUME` is different than [`CREATE`](persistent-volume.md).
+Note that `CREATE_DISK` is different than [`CREATE`](persistent-volume.md).
 `CREATE` creates a [persistent volume](persistent-volume.md) which indicates
 that the data stored in the volume will be persisted until the framework
 explicitly destroys it. It must operate on a non-`RAW` disk resource (i.e.,
 `PATH`, `MOUNT` or `BLOCK`).
 
-#### `DESTROY_VOLUME` operation
+#### `DESTROY_DISK` operation
 
-The offer operation `DESTROY_VOLUME` takes a volume, either a `PATH` or a
-`MOUNT` disk resource, to destroy, and converts it into a `RAW` disk resource.
-The quantity of the converted resource (`RAW` disk resource) will be the same as
-the specified `volume`.
+The offer operation `DESTROY_DISK` destroys a `MOUNT` or a `BLOCK` disk resource
+(`destroy_disk.source`), which will result in a `RAW` disk resource. The
+quantity of the `RAW` disk resource will be the same as the specified `source`,
+unless it has an invalid profile (described later), in which case the
+`DESTROY_DISK` operation will completely remove the disk resource.
 
 ```protobuf
 message Offer {
   message Operation {
-    message DestroyVolume {
-      required Resource volume = 1;
+    message DestroyDisk {
+      required Resource source = 1;
     }
-    optional DestroyVolume destroy_volume = 9;
+    optional DestroyDisk destroy_disk = 16;
   }
 }
 ```
 
-This operation is intended to be a reverse operation of `CREATE_VOLUME`. In
+This operation is intended to be a reverse operation of `CREATE_DISK`. In
 other words, if the volume is created from a storage pool (i.e., a `RAW` disk
-resource without an ID), the result of the corresponding `DESTROY_VOLUME` should
+resource without an ID), the result of the corresponding `DESTROY_DISK` should
 be a storage pool. And if the volume is created from a [pre-existing disk](#pre-existing-disks)
 (i.e., a `RAW` disk resource with an ID), the result of the corresponding
-`DESTROY_VOLUME` should be a pre-existing disk.
+`DESTROY_DISK` should be a pre-existing disk.
 
 Currently, Mesos infers the result based on the presence of an assigned
 [profile](#profiles) in the disk resource. In other words, if the volume to be
@@ -307,65 +287,17 @@ disk resource will be a pre-existing disk (i.e., `RAW` disk resource with an
 ID). This leverages the fact that currently, each storage pool must have a
 profile, and pre-existing disks do not have profiles.
 
-#### `CREATE_BLOCK` operation
-
-The offer operation `CREATE_BLOCK` is similar to `CREATE_VOLUME`, except that
-the converted disk resource will be in `BLOCK` type.
-
-```protobuf
-message Offer {
-  message Operation {
-    message CreateBlock {
-      required Resource source = 1;
-    }
-    optional CreateBlock create_block = 10;
-  }
-}
-```
-
-#### `DESTROY_BLOCK` operation
-
-The offer operation `DESTROY_BLOCK` is similar to `DESTROY_VOLUME`, except that
-the source disk resource will be in `BLOCK` type.
-
-```protobuf
-message Offer {
-  message Operation {
-    message DestroyBlock {
-      required Resource block = 1;
-    }
-    optional DestroyBlock destroy_block = 11;
-  }
-}
-```
-
 #### Getting Operation Results
 
 It is important for the frameworks to get the results of the above offer
 operations so that they know if the dynamic disk provisioning is successful or
 not.
 
-Unfortunately, the current scheduler API does not provide a way to give explicit
-offer operation feedback. Frameworks have to infer the result of the operation
-by looking at various sources of information that are available to them. Here are
-the tips to get offer operation results:
-
-* Leverage [reservation labels](reservation.md#reservation-labels). Reservation
-  labels can be used to uniquely identify a resource. By looking at the
-  reservation labels of an offered resource, the framework can infer if an
-  operation is successful or not.
-* Use [operator API](operator-http-api.md) to get the current set of resources.
-
-##### Explicit Operation Feedback
-
-Even if there are tips to infer offer operation results, it is far from ideal.
-The biggest issue is that it is impossible to get the failure reason if an offer
-operation fails. For instance, a CSI plugin might return a failure when creating
-a volume, and it is important for the framework to know about that and surface
-that information to the end user.
-
-As a result, we need a way to get explicit operation feedback just like task
-status updates. This feature is [coming soon](https://issues.apache.org/jira/browse/MESOS-8054).
+Starting with Mesos 1.6.0 it is possible to opt-in to receive status updates
+related to operations that affect resources managed by a resource provider. In
+order to do so, the framework has to set the `id` field in the operation.
+Support for operations affecting the agent default resources is [coming
+soon](https://issues.apache.org/jira/browse/MESOS-8194).
 
 ## Profiles
 
@@ -402,7 +334,7 @@ than low-level storage vendor specific parameters.
 ### Disk Profile Adaptor Module
 
 In order to let cluster operators customize the mapping between profiles and
-storage system-specific parameters, Mesos provides a [module](#modules.md)
+storage system-specific parameters, Mesos provides a [module](modules.md)
 interface called `DiskProfileAdaptor`.
 
 ```cpp
@@ -417,20 +349,20 @@ public:
 
   virtual Future<ProfileInfo> translate(
       const std::string& profile,
-      const std::string& csiPluginInfoType) = 0;
+      const ResourceProviderInfo& resourceProviderInfo) = 0;
 
   virtual Future<hashset<std::string>> watch(
       const hashset<std::string>& knownProfiles,
-      const std::string& csiPluginInfoType) = 0;
+      const ResourceProviderInfo& resourceProviderInfo) = 0;
 };
 ```
 
 The module interface has a `translate` method that takes a profile and returns
 the corresponding [CSI volume capability](https://github.com/container-storage-interface/spec/blob/v0.1.0/spec.md#createvolume)
 (i.e., the `capability` field) and [CSI volume creation parameters](https://github.com/container-storage-interface/spec/blob/v0.1.0/spec.md#createvolume)
-(i.e., the `parameter` field) for that profile. These two fields will be used to
+(i.e., the `parameters` field) for that profile. These two fields will be used to
 call the CSI `CreateVolume` interface during dynamic provisioning (i.e.,
-`CREATE_VOLUME` and `CREATE_BLOCK`), or CSI `ControllerPublishVolume` and
+`CREATE_DISK`), or CSI `ControllerPublishVolume` and
 `NodePublishVolume` when publishing (i.e., when a task using the disk resources
 is being launched on a Mesos agent).
 
@@ -454,14 +386,20 @@ module parameters that can be used to configure the module:
 
 * `uri`: URI to a JSON object containing the profile mapping. The module
   supports both HTTP(s) and file URIs. The JSON object should consist of some
-  top-level string keys corresponding to the profile.  Each value should contain
-  a `VolumeCapability` under `volumeCapabilities` and arbitrary key-value
-  pairs under `createParameters`. For example:
+  top-level string keys corresponding to the disk profile name. Each value
+  should contain a `ResourceProviderSelector` under `resource_provider_selector`
+  or a `CSIPluginTypeSelector` under `csi_plugin_type_selector` to specify the
+  set of resource providers this profile applies to, followed by a
+  `VolumeCapability` under `volume_capabilities` and arbitrary key-value pairs
+  under `create_parameters`. For example:
 
 ```json
 {
   "profile_matrix": {
     "my-profile": {
+      "csi_plugin_type_selector": {
+        "plugin_type": "org.apache.mesos.csi.test"
+      },
       "volume_capabilities": {
         "mount": {
           "fs_type": "xfs"
@@ -481,8 +419,8 @@ module parameters that can be used to configure the module:
 ```
 * `poll_interval`: How long to wait between polling the specified `uri`.  If the
   poll interval has elapsed since the last fetch, then the URI is re-fetched;
-  otherwise, a cached ProfileInfo is returned. If not specified, the URI is only
-  fetched once.
+  otherwise, a cached `ProfileInfo` is returned. If not specified, the URI is
+  only fetched once.
 * `max_random_wait`: How long at most to wait between discovering a new set of
   profiles and notifying the callers of `watch`. The actual wait time is a
   uniform random value between 0 and this value. If the `--uri` points to a
@@ -501,14 +439,14 @@ add the following JSON to the `--modules` agent flag, and set agent flag
       "modules": [
         {
           "name": "org_apache_mesos_UriDiskProfileAdaptor",
-          "parameters" : [
+          "parameters": [
             {
               "key": "uri",
-              "value" : "/PATH/TO/my_profile.json"
+              "value": "/PATH/TO/my_profile.json"
             },
             {
               "key": "poll_interval",
-              "value" : "1secs"
+              "value": "1secs"
             }
           ]
         }
@@ -787,7 +725,7 @@ still running, and will no longer launch the SLRP during startup. The master and
 the agent will think the SLRP has disconnected, similar to agent disconnection.
 If there exists a task that is using the disk resources provided by the SLRP,
 its execution will not be affected. However, offer operations (e.g.,
-`CREATE_VOLUME`) for the SLRP will not be successful. In fact, if a SLRP is
+`CREATE_DISK`) for the SLRP will not be successful. In fact, if a SLRP is
 disconnected, the master will rescind the offers related to that SLRP,
 effectively disallowing frameworks to perform operations on the disconnected
 SLRP.
@@ -864,5 +802,5 @@ provided by the Mesos agent. See more details about standalone container in the
   different agent node. The external disk resources support is coming soon.
 * The CSI plugin container cannot be a Docker container yet. Storage vendors
   currently should package the CSI plugins in binary format and use the
-  [fetcher](#fetcher.md) to fetch the binary executable.
+  [fetcher](fetcher.md) to fetch the binary executable.
 * `BLOCK` type disk resources are not supported yet.

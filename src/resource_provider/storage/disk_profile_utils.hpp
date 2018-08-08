@@ -17,6 +17,10 @@
 #ifndef __RESOURCE_PROVIDER_URI_DISK_PROFILE_UTILS_HPP__
 #define __RESOURCE_PROVIDER_URI_DISK_PROFILE_UTILS_HPP__
 
+#include <csi/spec.hpp>
+
+#include <mesos/mesos.hpp>
+
 #include <stout/option.hpp>
 #include <stout/try.hpp>
 
@@ -25,11 +29,17 @@
 
 namespace mesos {
 namespace internal {
-namespace profile {
+namespace storage {
 
 // Helper for parsing a string as the expected data format.
 Try<resource_provider::DiskProfileMapping> parseDiskProfileMapping(
     const std::string& data);
+
+
+// Helper for checking if a resource provider is selected for a profile.
+bool isSelectedResourceProvider(
+    const resource_provider::DiskProfileMapping::CSIManifest& profileManifest,
+    const ResourceProviderInfo& resourceProviderInfo);
 
 
 // Checks the fields inside a `DiskProfileMapping` according to the
@@ -39,9 +49,9 @@ Option<Error> validate(const resource_provider::DiskProfileMapping& mapping);
 
 // Checks the fields inside a `VolumeCapability` according to the
 // comments above the protobuf.
-Option<Error> validate(const csi::VolumeCapability& capability);
+Option<Error> validate(const csi::v0::VolumeCapability& capability);
 
-} // namespace profile {
+} // namespace storage {
 } // namespace internal {
 } // namespace mesos {
 

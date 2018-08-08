@@ -35,11 +35,11 @@ __CAVEAT:__ In order to modify a static reservation, the operator must drain and
 
 It's often more convenient to specify the total resources available on
 the slave as unreserved via the `--resources` flag and manage reservations
-dynamically (see below) via the master HTTP endpoints. However static reservation
-provides a way for the operator to more deterministically control the reservations
-(roles, amount, principals) before the agent is exposed to the master and
-frameworks. One use case is for the operator to dedicate entire agents for
-specific roles.
+dynamically (see below) via the master HTTP endpoints. However static
+reservation provides a way for the operator to more deterministically control
+the reservations (roles, amount, principals) before the agent is exposed to the
+master and frameworks. One use case is for the operator to dedicate entire
+agents for specific roles.
 
 
 ## Dynamic Reservation
@@ -279,8 +279,8 @@ these resources. First, we receive a resource offer (copy/pasted from above):
         }
 
 We can unreserve the 8 CPUs and 4096 MB of RAM by sending the following
-`Offer::Operation` message. `Offer::Operation::Unreserve` has a `resources` field
-which we can use to specify the resources to be unreserved.
+`Offer::Operation` message. `Offer::Operation::Unreserve` has a `resources`
+field which we can use to specify the resources to be unreserved.
 
         {
           "type": Offer::Operation::UNRESERVE,
@@ -327,8 +327,8 @@ It can then be refined to be __reserved__ for `"engineering/backend"`.
 
 Note that the refined reservation role must match the offer's allocation role.
 
-Suppose we receive a resource offer with 12 CPUs and 6144 MB of RAM unreserved,
-allocated to role `"engineering/backend"`, reserved to `"engineering"`.
+Suppose we receive a resource offer with 12 CPUs and 6144 MB of RAM reserved to
+`"engineering"`, allocated to role `"engineering/backend"`.
 
         {
           "allocation_info": { "role": "engineering/backend" },
@@ -344,9 +344,9 @@ allocated to role `"engineering/backend"`, reserved to `"engineering"`.
               "scalar": { "value": 12 },
               "reservations": [
                 {
-                  type: DYNAMIC,
-                  role: "engineering",
-                  principal: <principal>,
+                  "type": "DYNAMIC",
+                  "role": "engineering",
+                  "principal": <principal>,
                 }
               ]
             },
@@ -357,9 +357,9 @@ allocated to role `"engineering/backend"`, reserved to `"engineering"`.
               "scalar": { "value": 6144 },
               "reservations": [
                 {
-                  type: DYNAMIC,
-                  role: "engineering",
-                  principal: <principal>,
+                  "type": "DYNAMIC",
+                  "role": "engineering",
+                  "principal": <principal>,
                 }
               ]
             }
@@ -397,14 +397,14 @@ if authentication is disabled.
                 "scalar": { "value": 8 },
                 "reservations": [
                   {
-                    type: DYNAMIC,
-                    role: "engineering",
-                    principal: <principal>,
+                    "type": "DYNAMIC",
+                    "role": "engineering",
+                    "principal": <principal>,
                   },
                   {
-                    type: DYNAMIC,
-                    role: "engineering/backend",
-                    principal: <framework_principal>,
+                    "type": "DYNAMIC",
+                    "role": "engineering/backend",
+                    "principal": <framework_principal>,
                   }
                 ]
               },
@@ -415,14 +415,14 @@ if authentication is disabled.
                 "scalar": { "value": 4096 },
                 "reservations": [
                   {
-                    type: DYNAMIC,
-                    role: "engineering",
-                    principal: <principal>,
+                    "type": "DYNAMIC",
+                    "role": "engineering",
+                    "principal": <principal>,
                   },
                   {
-                    type: DYNAMIC,
-                    role: "engineering/backend",
-                    principal: <framework_principal>,
+                    "type": "DYNAMIC",
+                    "role": "engineering/backend",
+                    "principal": <framework_principal>,
                   }
                 ]
               }
@@ -447,14 +447,14 @@ following reserved resources:
               "scalar": { "value": 8 },
               "reservations": [
                 {
-                  type: DYNAMIC,
-                  role: "engineering",
-                  principal: <principal>,
+                  "type": "DYNAMIC",
+                  "role": "engineering",
+                  "principal": <principal>,
                 },
                 {
-                  type: DYNAMIC,
-                  role: "engineering/backend",
-                  principal: <framework_principal>,
+                  "type": "DYNAMIC",
+                  "role": "engineering/backend",
+                  "principal": <framework_principal>,
                 }
               ]
             },
@@ -465,14 +465,14 @@ following reserved resources:
               "scalar": { "value": 4096 },
               "reservations": [
                 {
-                  type: DYNAMIC,
-                  role: "engineering",
-                  principal: <principal>,
+                  "type": "DYNAMIC",
+                  "role": "engineering",
+                  "principal": <principal>,
                 },
                 {
-                  type: DYNAMIC,
-                  role: "engineering/backend",
-                  principal: <framework_principal>,
+                  "type": "DYNAMIC",
+                  "role": "engineering/backend",
+                  "principal": <framework_principal>,
                 }
               ]
             },
@@ -505,14 +505,14 @@ the `reservations` field being __popped__. First, we receive a resource offer
               "scalar": { "value": 8 },
               "reservations": [
                 {
-                  type: DYNAMIC,
-                  role: "engineering",
-                  principal: <principal>,
+                  "type": "DYNAMIC",
+                  "role": "engineering",
+                  "principal": <principal>,
                 },
                 {
-                  type: DYNAMIC,
-                  role: "engineering/backend",
-                  principal: <framework_principal>,
+                  "type": "DYNAMIC",
+                  "role": "engineering/backend",
+                  "principal": <framework_principal>,
                 }
               ]
             },
@@ -523,14 +523,14 @@ the `reservations` field being __popped__. First, we receive a resource offer
               "scalar": { "value": 4096 },
               "reservations": [
                 {
-                  type: DYNAMIC,
-                  role: "engineering",
-                  principal: <principal>,
+                  "type": "DYNAMIC",
+                  "role": "engineering",
+                  "principal": <principal>,
                 },
                 {
-                  type: DYNAMIC,
-                  role: "engineering/backend",
-                  principal: <framework_principal>,
+                  "type": "DYNAMIC",
+                  "role": "engineering/backend",
+                  "principal": <framework_principal>,
                 }
               ]
             },
@@ -539,8 +539,8 @@ the `reservations` field being __popped__. First, we receive a resource offer
 
 
 We can unreserve the 8 CPUs and 4096 MB of RAM by sending the following
-`Offer::Operation` message. `Offer::Operation::Unreserve` has a `resources` field
-which we can use to specify the resources to be unreserved.
+`Offer::Operation` message. `Offer::Operation::Unreserve` has a `resources`
+field which we can use to specify the resources to be unreserved.
 
         {
           "type": Offer::Operation::UNRESERVE,
@@ -553,14 +553,14 @@ which we can use to specify the resources to be unreserved.
                 "scalar": { "value": 8 },
                 "reservations": [
                   {
-                    type: DYNAMIC,
-                    role: "engineering",
-                    principal: <principal>,
+                    "type": "DYNAMIC",
+                    "role": "engineering",
+                    "principal": <principal>,
                   },
                   {
-                    type: DYNAMIC,
-                    role: "engineering/backend",
-                    principal: <framework_principal>,
+                    "type": "DYNAMIC",
+                    "role": "engineering/backend",
+                    "principal": <framework_principal>,
                   }
                 ]
               },
@@ -571,14 +571,14 @@ which we can use to specify the resources to be unreserved.
                 "scalar": { "value": 4096 },
                 "reservations": [
                   {
-                    type: DYNAMIC,
-                    role: "engineering",
-                    principal: <principal>,
+                    "type": "DYNAMIC",
+                    "role": "engineering",
+                    "principal": <principal>,
                   },
                   {
-                    type: DYNAMIC,
-                    role: "engineering/backend",
-                    principal: <framework_principal>,
+                    "type": "DYNAMIC",
+                    "role": "engineering/backend",
+                    "principal": <framework_principal>,
                   }
                 ]
               },
@@ -623,19 +623,25 @@ We send an HTTP POST request to the master's
               "name": "cpus",
               "type": "SCALAR",
               "scalar": { "value": 8 },
-              "role": "ads",
-              "reservation": {
-                "principal": <operator_principal>
-              }
+              "reservations": [
+                {
+                  "type": "DYNAMIC",
+                  "role": "ads",
+                  "principal": <operator_principal>,
+                }
+              ]
             },
             {
               "name": "mem",
               "type": "SCALAR",
               "scalar": { "value": 4096 },
-              "role": "ads",
-              "reservation": {
-                "principal": <operator_principal>
-              }
+              "reservations": [
+                {
+                  "type": "DYNAMIC",
+                  "role": "ads",
+                  "principal": <operator_principal>,
+                }
+              ]
             }
           ]' \
           -X POST http://<ip>:<port>/master/reserve
@@ -671,19 +677,25 @@ We can send an HTTP POST request to the master's
               "name": "cpus",
               "type": "SCALAR",
               "scalar": { "value": 8 },
-              "role": "ads",
-              "reservation": {
-                "principal": <reserver_principal>
-              }
+              "reservations": [
+                {
+                  "type": "DYNAMIC",
+                  "role": "ads",
+                  "principal": <reserver_principal>,
+                }
+              ]
             },
             {
               "name": "mem",
               "type": "SCALAR",
               "scalar": { "value": 4096 },
-              "role": "ads",
-              "reservation": {
-                "principal": <reserver_principal>
-              }
+              "reservations": [
+                {
+                  "type": "DYNAMIC",
+                  "role": "ads",
+                  "principal": <reserver_principal>,
+                }
+              ]
             }
           ]' \
           -X POST http://<ip>:<port>/master/unreserve

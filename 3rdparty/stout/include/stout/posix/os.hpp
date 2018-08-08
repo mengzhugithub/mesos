@@ -166,6 +166,28 @@ inline void setenv(const std::string& key,
 // environment variables.
 inline void unsetenv(const std::string& key)
 {
+  // NOTE: This function explicitly does not clear from
+  // `/proc/$pid/environ` because that is defined to be the initial
+  // environment that was set when the process was started, so don't
+  // use this to delete secrets! Instead, see `os::eraseenv`.
+  ::unsetenv(key.c_str());
+}
+
+
+// Erases the value associated with the specified key from the set of
+// environment variables. By erase, we even clear it from
+// `/proc/$pid/environ` so that sensitive information conveyed via
+// environment variables (such as secrets) can be cleaned up.
+inline void eraseenv(const std::string& key)
+{
+  char* value = ::getenv(key.c_str());
+
+  // Erase the old value so that on Linux it can't be inspected
+  // through `/proc/$pid/environ`, useful for secrets.
+  if (value) {
+    ::memset(value, '\0', ::strlen(value));
+  }
+
   ::unsetenv(key.c_str());
 }
 
@@ -386,17 +408,17 @@ inline Try<Version> release()
   // TODO(karya): Replace sscanf with Version::parse() once Version
   // starts supporting labels and build metadata.
   if (::sscanf(
-          info.get().release.c_str(),
+          info->release.c_str(),
           "%d.%d.%d",
           &major,
           &minor,
           &patch) != 3) {
-    return Error("Failed to parse: " + info.get().release);
+    return Error("Failed to parse: " + info->release);
   }
 #else
   // TODO(dforsyth): Handle FreeBSD patch versions (-pX).
-  if (::sscanf(info.get().release.c_str(), "%d.%d-%*s", &major, &minor) != 2) {
-    return Error("Failed to parse: " + info.get().release);
+  if (::sscanf(info->release.c_str(), "%d.%d-%*s", &major, &minor) != 2) {
+    return Error("Failed to parse: " + info->release);
   }
 #endif
   return Version(major, minor, patch);

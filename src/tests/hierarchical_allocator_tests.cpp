@@ -134,7 +134,7 @@ protected:
       nextSlaveId(1),
       nextFrameworkId(1) {}
 
-  ~HierarchicalAllocatorTestBase()
+  ~HierarchicalAllocatorTestBase() override
   {
     delete allocator;
   }
@@ -176,11 +176,20 @@ protected:
         };
     }
 
+    vector<Resources> minAllocatableResources;
+    minAllocatableResources.push_back(
+        CHECK_NOTERROR(Resources::parse("cpus:" + stringify(MIN_CPUS))));
+    minAllocatableResources.push_back(CHECK_NOTERROR(Resources::parse(
+        "mem:" + stringify((double)MIN_MEM.bytes() / Bytes::MEGABYTES))));
+
     allocator->initialize(
         flags.allocation_interval,
         offerCallback.get(),
         inverseOfferCallback.get(),
-        flags.fair_sharing_excluded_resource_names);
+        flags.fair_sharing_excluded_resource_names,
+        true,
+        None(),
+        minAllocatableResources);
   }
 
   SlaveInfo createSlaveInfo(const Resources& resources)
@@ -2220,6 +2229,77 @@ TEST_F(HierarchicalAllocatorTest, UpdateAllocation)
 }
 
 
+// This test ensures that frameworks can apply resource conversions that remove
+// resources from their allocations and the agent's total resources.
+TEST_F(HierarchicalAllocatorTest, UpdateAllocationRemoveResources)
+{
+  Clock::pause();
+
+  initialize();
+
+  SlaveInfo slave = createSlaveInfo("cpus:100;mem:100;disk:100");
+  allocator->addSlave(
+      slave.id(),
+      slave,
+      AGENT_CAPABILITIES(),
+      None(),
+      slave.resources(),
+      {});
+
+  // Initially, all the resources are allocated.
+  FrameworkInfo framework = createFrameworkInfo({"role1"});
+  allocator->addFramework(framework.id(), framework, {}, true, {});
+
+  Allocation expected = Allocation(
+      framework.id(),
+      {{"role1", {{slave.id(), slave.resources()}}}});
+
+  Future<Allocation> allocation = allocations.get();
+  AWAIT_EXPECT_EQ(expected, allocation);
+
+  // Construct a resource conversion that removes all disks from the framework's
+  // allocation and the total resources.
+  Resource removed = Resources::parse("disk", "100", "*").get();
+  removed.mutable_allocation_info()->set_role("role1");
+  vector<ResourceConversion> conversions{
+    ResourceConversion(removed, Resources())
+  };
+
+  // Ensure that the resource conversion can be applied.
+  Try<Resources> updated =
+    allocation->resources.at("role1").at(slave.id()).apply(conversions);
+
+  ASSERT_SOME(updated);
+  EXPECT_NONE(updated->disk());
+
+  // Update the allocation in the allocator.
+  allocator->updateAllocation(
+      framework.id(),
+      slave.id(),
+      allocation->resources.at("role1").at(slave.id()),
+      conversions);
+
+  // Now recover the resources, and expect that the next allocation contains the
+  // updated resources.
+  allocator->recoverResources(
+      framework.id(),
+      slave.id(),
+      updated.get(),
+      None());
+
+  Clock::advance(flags.allocation_interval);
+
+  // The allocation should be the agent's resources with the resource conversion
+  // applied.
+  expected = Allocation(
+      framework.id(),
+      {{"role1", {{slave.id(), updated.get()}}}});
+
+  allocation = allocations.get();
+  AWAIT_EXPECT_EQ(expected, allocation);
+}
+
+
 // This test verifies that `updateAllocation()` supports creating and
 // destroying shared persistent volumes.
 TEST_F(HierarchicalAllocatorTest, UpdateAllocationSharedPersistentVolume)
@@ -2684,7 +2764,7 @@ TEST_F(HierarchicalAllocatorTest, UpdateSlaveCapabilities)
   // Add a MULTI_ROLE framework. We explicitly check the capability here
   // in case `createFrameworkInfo` helper changes in the future.
   FrameworkInfo framework = createFrameworkInfo({"role1"});
-  EXPECT_EQ(1u, framework.capabilities_size());
+  EXPECT_EQ(1, framework.capabilities_size());
   EXPECT_EQ(FrameworkInfo::Capability::MULTI_ROLE,
             framework.capabilities().begin()->type());
   allocator->addFramework(framework.id(), framework, {}, true, {});
@@ -5515,6 +5595,107 @@ TEST_F(HierarchicalAllocatorTest, OfferAncestorReservationsToDescendantChild)
 }
 
 
+// This test ensures that resources can be correctly allocated in
+// the presence of quota when a parent role's reservation is allocated
+// to a child role. Specifically, it checks that a parent role's
+// reservations allocated to a child role are correctly considered
+// as an allocated reservation by the quota headroom calculation.
+// See MESOS-8604.
+TEST_F(HierarchicalAllocatorTest, QuotaWithAncestorReservations)
+{
+  Clock::pause();
+
+  initialize();
+
+  const string QUOTA_ROLE{"quota-role"};
+  const string NO_QUOTA_ROLE{"no-quota-role"};
+  const string PARENT_ROLE{"a"};
+  const string CHILD_ROLE{"a/b"};
+
+  Quota quota = createQuota(QUOTA_ROLE, "cpus:1;mem:1024");
+  allocator->setQuota(QUOTA_ROLE, quota);
+
+  // This agent is reserved for the parent role `a`.
+  SlaveInfo agent1 = createSlaveInfo("cpus(a):1;mem(a):1024");
+  allocator->addSlave(
+      agent1.id(),
+      agent1,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent1.resources(),
+      {});
+
+  // Add framework1 under the child role `a/b`.
+  FrameworkInfo framework1 = createFrameworkInfo({CHILD_ROLE});
+  allocator->addFramework(framework1.id(), framework1, {}, true, {});
+
+  // All of agent1's resources are allocated to `framework1` under `a/b`
+  // because it is reserved by its ancestor `a`.
+  Allocation expected = Allocation(
+      framework1.id(),
+      {{CHILD_ROLE, {{agent1.id(), agent1.resources()}}}});
+
+  AWAIT_EXPECT_EQ(expected, allocations.get());
+
+  // Add framework2 under `NO_QUOTA_ROLE`.
+  FrameworkInfo framework2 = createFrameworkInfo({NO_QUOTA_ROLE});
+  allocator->addFramework(framework2.id(), framework2, {}, true, {});
+
+  // No allocations are made because there is no free resources.
+  Future<Allocation> allocation = allocations.get();
+  EXPECT_TRUE(allocation.isPending());
+
+  // Add agent2 and agent3 with the same resources as `quota`.
+
+  Resources agentResources = Resources::parse("cpus:1;mem:1024").get();
+
+  SlaveInfo agent2 = createSlaveInfo("cpus:1;mem:1024");
+  allocator->addSlave(
+      agent2.id(),
+      agent2,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent2.resources(),
+      {});
+
+  SlaveInfo agent3 = createSlaveInfo("cpus:1;mem:1024");
+  allocator->addSlave(
+      agent3.id(),
+      agent3,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent3.resources(),
+      {});
+
+  // Required headroom: quota(cpus:1;mem:1024)
+  //
+  // Available headroom = total resources (cpus:3;mem:3072) -
+  //                      allocated resources (cpus:1;mem:1024) -
+  //                      unallocated reservations (cpus:0;mem:0)
+  //                    = (cpus:2;mem:2048)
+  //
+  // Resources that can allocated without breaking quota headroom =
+  //   available headroom - required headroom = (cpus:1;mem:1024)
+
+  // Either agent2 or agent3 will be set aside for the quota headroom for
+  // role `QUOTA_ROLE`. The other will be offered to framework2, because
+  // it hasn't got any resources and has the lowest share.
+  //
+  // Agent2 and agent3 have identical resources. We only care that the
+  // framework can get either of them.
+
+  AWAIT_READY(allocation);
+
+  ASSERT_EQ(allocation->frameworkId, framework2.id());
+  ASSERT_EQ(1u, allocation->resources.size());
+  ASSERT_TRUE(allocation->resources.contains(NO_QUOTA_ROLE));
+
+  agentResources.allocate(NO_QUOTA_ROLE);
+  EXPECT_EQ(agentResources,
+            Resources::sum(allocation->resources.at(NO_QUOTA_ROLE)));
+}
+
+
 // This test checks that quota guarantees work as expected when a
 // nested role is created as a child of an existing quota'd role.
 TEST_F(HierarchicalAllocatorTest, NestedRoleQuota)
@@ -7135,7 +7316,7 @@ TEST_P(HierarchicalAllocator_BENCHMARK_Test, AllocatorBacklog)
   watch.stop();
 
   metrics = Metrics();
-  ASSERT_EQ(1, metrics.values.count(metric));
+  ASSERT_EQ(1u, metrics.values.count(metric));
   int runs2 = metrics.values[metric].as<JSON::Number>().as<int>();
 
   cout << "Added " << agentCount << " agents in "
@@ -7157,7 +7338,7 @@ TEST_P(HierarchicalAllocator_BENCHMARK_Test, AllocatorBacklog)
   watch.stop();
 
   metrics = Metrics();
-  ASSERT_EQ(1, metrics.values.count(metric));
+  ASSERT_EQ(1u, metrics.values.count(metric));
   int runs3 = metrics.values[metric].as<JSON::Number>().as<int>();
 
   cout << "Processed " << frameworkCount << " `reviveOffers` calls"

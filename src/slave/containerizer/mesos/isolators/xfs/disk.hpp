@@ -21,6 +21,8 @@
 
 #include <process/owned.hpp>
 
+#include <process/metrics/push_gauge.hpp>
+
 #include <stout/bytes.hpp>
 #include <stout/duration.hpp>
 #include <stout/hashmap.hpp>
@@ -40,46 +42,57 @@ class XfsDiskIsolatorProcess : public MesosIsolatorProcess
 public:
   static Try<mesos::slave::Isolator*> create(const Flags& flags);
 
-  virtual ~XfsDiskIsolatorProcess();
+  ~XfsDiskIsolatorProcess() override;
 
   process::PID<XfsDiskIsolatorProcess> self() const
   {
     return process::PID<XfsDiskIsolatorProcess>(this);
   }
 
-  virtual process::Future<Nothing> recover(
-      const std::list<mesos::slave::ContainerState>& states,
-      const hashset<ContainerID>& orphans);
+  process::Future<Nothing> recover(
+      const std::vector<mesos::slave::ContainerState>& states,
+      const hashset<ContainerID>& orphans) override;
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig);
+      const mesos::slave::ContainerConfig& containerConfig) override;
 
-  virtual process::Future<Nothing> isolate(
+  process::Future<mesos::slave::ContainerLimitation> watch(
+      const ContainerID& containerId) override;
+
+  process::Future<Nothing> update(
       const ContainerID& containerId,
-      pid_t pid);
+      const Resources& resources) override;
 
-  virtual process::Future<Nothing> update(
-      const ContainerID& containerId,
-      const Resources& resources);
+  process::Future<ResourceStatistics> usage(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<ResourceStatistics> usage(
-      const ContainerID& containerId);
+  process::Future<Nothing> cleanup(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<Nothing> cleanup(
-      const ContainerID& containerId);
+protected:
+  void initialize() override;
 
 private:
   XfsDiskIsolatorProcess(
+      Duration watchInterval,
       xfs::QuotaPolicy quotaPolicy,
       const std::string& workDir,
-      const IntervalSet<prid_t>& projectIds);
+      const IntervalSet<prid_t>& projectIds,
+      Duration projectWatchInterval);
+
+  // Responsible for validating a container hasn't broken the soft limit.
+  void check();
 
   // Take the next project ID from the unallocated pool.
   Option<prid_t> nextProjectId();
 
   // Return this project ID to the unallocated pool.
   void returnProjectId(prid_t projectId);
+
+  // Check which project IDs are currently in use and deallocate the ones
+  // that are not.
+  void reclaimProjectIds();
 
   struct Info
   {
@@ -89,13 +102,27 @@ private:
     const std::string directory;
     Bytes quota;
     const prid_t projectId;
+    process::Promise<mesos::slave::ContainerLimitation> limitation;
   };
 
+  const Duration watchInterval;
+  const Duration projectWatchInterval;
   xfs::QuotaPolicy quotaPolicy;
   const std::string workDir;
   const IntervalSet<prid_t> totalProjectIds;
   IntervalSet<prid_t> freeProjectIds;
   hashmap<ContainerID, process::Owned<Info>> infos;
+  hashmap<prid_t, std::string> scheduledProjects;
+
+  // Metrics used by the XFS disk isolator.
+  struct Metrics
+  {
+    Metrics();
+    ~Metrics();
+
+    process::metrics::PushGauge project_ids_total;
+    process::metrics::PushGauge project_ids_free;
+  } metrics;
 };
 
 } // namespace slave {

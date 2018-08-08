@@ -26,6 +26,7 @@
 #include <process/id.hpp>
 #include <process/owned.hpp>
 
+#include <stout/boundedhashmap.hpp>
 #include <stout/duration.hpp>
 #include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
@@ -38,6 +39,7 @@
 #include "master/allocator/mesos/metrics.hpp"
 
 #include "master/allocator/sorter/drf/sorter.hpp"
+#include "master/allocator/sorter/random/sorter.hpp"
 
 #include "master/constants.hpp"
 
@@ -60,6 +62,12 @@ HierarchicalDRFAllocatorProcess;
 typedef MesosAllocator<HierarchicalDRFAllocatorProcess>
 HierarchicalDRFAllocator;
 
+typedef HierarchicalAllocatorProcess<RandomSorter, RandomSorter, RandomSorter>
+HierarchicalRandomAllocatorProcess;
+
+typedef MesosAllocator<HierarchicalRandomAllocatorProcess>
+HierarchicalRandomAllocator;
+
 
 namespace internal {
 
@@ -80,11 +88,12 @@ public:
     : initialized(false),
       paused(true),
       metrics(*this),
+      completedFrameworkMetrics(0),
       roleSorter(roleSorterFactory()),
       quotaRoleSorter(quotaRoleSorterFactory()),
       frameworkSorterFactory(_frameworkSorterFactory) {}
 
-  virtual ~HierarchicalAllocatorProcess() {}
+  ~HierarchicalAllocatorProcess() override {}
 
   process::PID<HierarchicalAllocatorProcess> self() const
   {
@@ -104,32 +113,35 @@ public:
       const Option<std::set<std::string>>&
         fairnessExcludeResourceNames = None(),
       bool filterGpuResources = true,
-      const Option<DomainInfo>& domain = None());
+      const Option<DomainInfo>& domain = None(),
+      const Option<std::vector<Resources>>&
+        minAllocatableResources = None(),
+      const size_t maxCompletedFrameworks = 0) override;
 
   void recover(
       const int _expectedAgentCount,
-      const hashmap<std::string, Quota>& quotas);
+      const hashmap<std::string, Quota>& quotas) override;
 
   void addFramework(
       const FrameworkID& frameworkId,
       const FrameworkInfo& frameworkInfo,
       const hashmap<SlaveID, Resources>& used,
       bool active,
-      const std::set<std::string>& suppressedRoles);
+      const std::set<std::string>& suppressedRoles) override;
 
   void removeFramework(
-      const FrameworkID& frameworkId);
+      const FrameworkID& frameworkId) override;
 
   void activateFramework(
-      const FrameworkID& frameworkId);
+      const FrameworkID& frameworkId) override;
 
   void deactivateFramework(
-      const FrameworkID& frameworkId);
+      const FrameworkID& frameworkId) override;
 
   void updateFramework(
       const FrameworkID& frameworkId,
       const FrameworkInfo& frameworkInfo,
-      const std::set<std::string>& suppressedRoles);
+      const std::set<std::string>& suppressedRoles) override;
 
   void addSlave(
       const SlaveID& slaveId,
@@ -137,84 +149,85 @@ public:
       const std::vector<SlaveInfo::Capability>& capabilities,
       const Option<Unavailability>& unavailability,
       const Resources& total,
-      const hashmap<FrameworkID, Resources>& used);
+      const hashmap<FrameworkID, Resources>& used) override;
 
   void removeSlave(
-      const SlaveID& slaveId);
+      const SlaveID& slaveId) override;
 
   void updateSlave(
       const SlaveID& slave,
       const SlaveInfo& slaveInfo,
       const Option<Resources>& total = None(),
-      const Option<std::vector<SlaveInfo::Capability>>& capabilities = None());
+      const Option<std::vector<SlaveInfo::Capability>>& capabilities = None())
+    override;
 
   void addResourceProvider(
       const SlaveID& slave,
       const Resources& total,
-      const hashmap<FrameworkID, Resources>& used);
+      const hashmap<FrameworkID, Resources>& used) override;
 
   void deactivateSlave(
-      const SlaveID& slaveId);
+      const SlaveID& slaveId) override;
 
   void activateSlave(
-      const SlaveID& slaveId);
+      const SlaveID& slaveId) override;
 
   void updateWhitelist(
-      const Option<hashset<std::string>>& whitelist);
+      const Option<hashset<std::string>>& whitelist) override;
 
   void requestResources(
       const FrameworkID& frameworkId,
-      const std::vector<Request>& requests);
+      const std::vector<Request>& requests) override;
 
   void updateAllocation(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& offeredResources,
-      const std::vector<ResourceConversion>& conversions);
+      const std::vector<ResourceConversion>& conversions) override;
 
   process::Future<Nothing> updateAvailable(
       const SlaveID& slaveId,
-      const std::vector<Offer::Operation>& operations);
+      const std::vector<Offer::Operation>& operations) override;
 
   void updateUnavailability(
       const SlaveID& slaveId,
-      const Option<Unavailability>& unavailability);
+      const Option<Unavailability>& unavailability) override;
 
   void updateInverseOffer(
       const SlaveID& slaveId,
       const FrameworkID& frameworkId,
       const Option<UnavailableResources>& unavailableResources,
       const Option<mesos::allocator::InverseOfferStatus>& status,
-      const Option<Filters>& filters);
+      const Option<Filters>& filters) override;
 
   process::Future<
       hashmap<SlaveID,
       hashmap<FrameworkID, mesos::allocator::InverseOfferStatus>>>
-    getInverseOfferStatuses();
+    getInverseOfferStatuses() override;
 
   void recoverResources(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& resources,
-      const Option<Filters>& filters);
+      const Option<Filters>& filters) override;
 
   void suppressOffers(
       const FrameworkID& frameworkId,
-      const std::set<std::string>& roles);
+      const std::set<std::string>& roles) override;
 
   void reviveOffers(
       const FrameworkID& frameworkId,
-      const std::set<std::string>& roles);
+      const std::set<std::string>& roles) override;
 
   void setQuota(
       const std::string& role,
-      const Quota& quota);
+      const Quota& quota) override;
 
   void removeQuota(
-      const std::string& role);
+      const std::string& role) override;
 
   void updateWeights(
-      const std::vector<WeightInfo>& weightInfos);
+      const std::vector<WeightInfo>& weightInfos) override;
 
 protected:
   // Useful typedefs for dispatch/delay/defer to self()/this.
@@ -280,7 +293,7 @@ protected:
       const FrameworkID& frameworkID,
       const SlaveID& slaveID) const;
 
-  static bool allocatable(const Resources& resources);
+  bool allocatable(const Resources& resources);
 
   bool initialized;
   bool paused;
@@ -303,6 +316,8 @@ protected:
   friend Metrics;
   Metrics metrics;
 
+  // TODO(mzhu): Pull out the nested Framework struct for clearer
+  // logic division with the allocator.
   struct Framework
   {
     Framework(
@@ -323,6 +338,8 @@ protected:
     hashmap<SlaveID, hashset<InverseOfferFilter*>> inverseOfferFilters;
 
     bool active;
+
+    process::Owned<FrameworkMetrics> metrics;
   };
 
   double _event_queue_dispatches()
@@ -345,42 +362,56 @@ protected:
 
   hashmap<FrameworkID, Framework> frameworks;
 
-  struct Slave
+  BoundedHashMap<FrameworkID, process::Owned<FrameworkMetrics>>
+    completedFrameworkMetrics;
+
+  // TODO(mzhu): Pull out the nested Slave class for clearer
+  // logic division with the allocator.
+  class Slave
   {
-    // Total amount of regular *and* oversubscribed resources.
-    Resources total;
-
-    // Regular *and* oversubscribed resources that are allocated.
-    //
-    // NOTE: We maintain multiple copies of each shared resource allocated
-    // to a slave, where the number of copies represents the number of times
-    // this shared resource has been allocated to (and has not been recovered
-    // from) a specific framework.
-    //
-    // NOTE: We keep track of slave's allocated resources despite
-    // having that information in sorters. This is because the
-    // information in sorters is not accurate if some framework
-    // hasn't reregistered. See MESOS-2919 for details.
-    Resources allocated;
-
-    // We track the total and allocated resources on the slave, the
-    // available resources are computed as follows:
-    //
-    //   available = total - allocated
-    //
-    // Note that it's possible for the slave to be over-allocated!
-    // In this case, allocated > total.
-    Resources available() const
+  public:
+    Slave(
+        const SlaveInfo& _info,
+        const protobuf::slave::Capabilities& _capabilities,
+        bool _activated,
+        const Resources& _total,
+        const Resources& _allocated)
+      : info(_info),
+        capabilities(_capabilities),
+        activated(_activated),
+        total(_total),
+        allocated(_allocated),
+        shared(_total.shared())
     {
-      // In order to subtract from the total,
-      // we strip the allocation information.
-      Resources allocated_ = allocated;
-      allocated_.unallocate();
-
-      return total - allocated_;
+      updateAvailable();
     }
 
-    bool activated;  // Whether to offer resources.
+    const Resources& getTotal() const { return total; }
+
+    const Resources& getAllocated() const { return allocated; }
+
+    const Resources& getAvailable() const { return available; }
+
+    void updateTotal(const Resources& newTotal) {
+      total = newTotal;
+      shared = total.shared();
+
+      updateAvailable();
+    }
+
+    void allocate(const Resources& toAllocate)
+    {
+      allocated += toAllocate;
+
+      updateAvailable();
+    }
+
+    void unallocate(const Resources& toUnallocate)
+    {
+      allocated -= toUnallocate;
+
+      updateAvailable();
+    }
 
     // The `SlaveInfo` that was passed to the allocator when the slave was added
     // or updated. Currently only two fields are used: `hostname` for host
@@ -389,6 +420,8 @@ protected:
     SlaveInfo info;
 
     protobuf::slave::Capabilities capabilities;
+
+    bool activated; // Whether to offer resources.
 
     // Represents a scheduled unavailability due to maintenance for a specific
     // slave, and the responses from frameworks as to whether they will be able
@@ -425,6 +458,63 @@ protected:
     // a given point in time, for an optional duration. This information is used
     // to send out `InverseOffers`.
     Option<Maintenance> maintenance;
+
+  private:
+    void updateAvailable() {
+      // In order to subtract from the total,
+      // we strip the allocation information.
+      Resources allocated_ = allocated;
+      allocated_.unallocate();
+
+      // Calling `nonShared()` currently copies the underlying resources
+      // and is therefore rather expensive. We avoid it in the common
+      // case that there are no shared resources.
+      //
+      // TODO(mzhu): Ideally there would be a single logical path here.
+      // One solution is to have `Resources` be copy-on-write such that
+      // `nonShared()` performs no copying and instead points to a
+      // subset of the original `Resource` objects.
+      if (shared.empty()) {
+        available = total - allocated_;
+      } else {
+        // Since shared resources are offerable even when they are in use, we
+        // always include them as part of available resources.
+        available = (total.nonShared() - allocated_.nonShared()) + shared;
+      }
+    }
+
+    // Total amount of regular *and* oversubscribed resources.
+    Resources total;
+
+    // Regular *and* oversubscribed resources that are allocated.
+    //
+    // NOTE: We maintain multiple copies of each shared resource allocated
+    // to a slave, where the number of copies represents the number of times
+    // this shared resource has been allocated to (and has not been recovered
+    // from) a specific framework.
+    //
+    // NOTE: We keep track of the slave's allocated resources despite
+    // having that information in sorters. This is because the
+    // information in sorters is not accurate if some framework
+    // hasn't reregistered. See MESOS-2919 for details.
+    Resources allocated;
+
+    // We track the total and allocated resources on the slave to
+    // avoid calculating it in place every time.
+    //
+    // Note that `available` always contains all the shared resources on the
+    // agent regardless whether they have ever been allocated or not.
+    // NOTE, however, we currently only offer a shared resource only if it has
+    // not been offered in an allocation cycle to a framework. We do this mainly
+    // to preserve the normal offer behavior. This may change in the future
+    // depending on use cases.
+    //
+    // Note that it's possible for the slave to be over-allocated!
+    // In this case, allocated > total.
+    Resources available;
+
+    // We keep a copy of the shared resources to avoid unnecessary copying.
+    Resources shared;
   };
 
   hashmap<SlaveID, Slave> slaves;
@@ -444,19 +534,13 @@ protected:
   // (e.g. some tasks and/or executors are consuming resources under the role).
   hashmap<std::string, hashset<FrameworkID>> roles;
 
-  // Configured quota for each role, if any. Setting quota for a role
-  // changes the order that the role's frameworks are offered
-  // resources. Quota comes before fair share, hence setting quota moves
-  // the role's frameworks towards the front of the allocation queue.
-  //
-  // NOTE: We currently associate quota with roles, but this may
-  // change in the future.
+  // Configured quota for each role, if any. If a role does not have
+  // an entry here it has the default quota of (no guarantee, no limit).
   hashmap<std::string, Quota> quotas;
 
   // Aggregated resource reservations on all agents tied to a
   // particular role, if any. These are stripped scalar quantities
-  // that contain no meta-data. Used for accounting resource
-  // reservations for quota limit.
+  // that contain no meta-data.
   //
   // Only roles with non-empty reservations will be stored in the map.
   hashmap<std::string, Resources> reservationScalarQuantities;
@@ -473,11 +557,17 @@ protected:
   // The master's domain, if any.
   Option<DomainInfo> domain;
 
-  // There are two stages of allocation. During the first stage resources
-  // are allocated only to frameworks under roles with quota set. During
-  // the second stage remaining resources that would not be required to
-  // satisfy un-allocated quota are then allocated to frameworks under
-  // roles with no quota set.
+  // The minimum allocatable resources, if any.
+  Option<std::vector<Resources>> minAllocatableResources;
+
+  // There are two stages of allocation:
+  //
+  //   Stage 1: Allocate to satisfy quota guarantees.
+  //
+  //   Stage 2: Allocate above quota guarantees up to quota limits.
+  //            Note that we need to hold back enough "headroom"
+  //            to ensure that any unsatisfied quota can be
+  //            satisfied later.
   //
   // Each stage comprises two levels of sorting, hence "hierarchical".
   // Level 1 sorts across roles:
@@ -510,24 +600,23 @@ protected:
   // The total cluster resources are used as the resource pool.
   process::Owned<Sorter> roleSorter;
 
-  // A dedicated sorter for roles for which quota is set. This sorter
-  // determines the order in which quota'ed roles are allocated resources
-  // during Level 1 of the first stage. Quota'ed roles have resources
-  // allocated up to their allocated quota (the first stage) prior to
-  // non-quota'ed roles (the second stage). Since only non-revocable
+  // TODO(bmahler): Remove this in favor of either using the same sorting
+  // between satisfying guarantees and bursting above guarantees up to
+  // limits, or have a different sorting technique specifically for
+  // satisfying guarantees (e.g. MESOS-8026). This is tech debt from
+  // when a "quota role" was considered different from a "non-quota"
+  // role. However, they are the same, one just has a default quota.
+  //
+  // A dedicated sorter for roles that have a non-default quota.
+  // This sorter determines the order in which guarantees are allocated
+  // during Level 1 of the first stage. Since only non-revocable
   // resources are available for quota, the total cluster non-revocable
-  // resoures are used as the resource pool.
+  // resources are used as the resource pool.
   //
-  // NOTE: A role appears in `quotaRoleSorter` if it has a quota (even if
-  // no frameworks are currently registered in that role). In contrast,
-  // `roleSorter` only contains entries for roles with one or more
-  // registered frameworks.
-  //
-  // NOTE: We do not include revocable resources in the quota role sorter,
-  // because the quota role sorter's job is to perform fair sharing between
-  // the quota roles as it pertains to their level of quota satisfaction.
-  // Since revocable resources do not increase a role's level of satisfaction
-  // toward its quota, we choose to exclude them from the quota role sorter.
+  // NOTE: A role appears in `quotaRoleSorter` if it has a non-default
+  // quota (even if no frameworks are currently registered in that role).
+  // In contrast, `roleSorter` only contains entries for roles with one
+  // or more registered frameworks.
   process::Owned<Sorter> quotaRoleSorter;
 
   // A collection of sorters, one per active role. Each sorter determines
@@ -583,6 +672,24 @@ private:
   // different region than the master. This can only be the case if
   // the agent and the master are both configured with a fault domain.
   bool isRemoteSlave(const Slave& slave) const;
+
+  // Helper function that checks if a framework is capable of
+  // receiving resources on the agent based on the framework capability.
+  //
+  // TODO(mzhu): Make this a `Framework` member function once we pull
+  // `struct Framework` out from being nested.
+  bool isCapableOfReceivingAgent(
+      const protobuf::framework::Capabilities& frameworkCapabilities,
+      const Slave& slave) const;
+
+  // Helper function that removes any resources that the framework is not
+  // capable of receiving based on the given framework capability.
+  //
+  // TODO(mzhu): Make this a `Framework` member function once we pull
+  // `struct Framework` out from being nested.
+  Resources stripIncapableResources(
+      const Resources& resources,
+      const protobuf::framework::Capabilities& frameworkCapabilities) const;
 
   // Helper to track allocated resources on an agent.
   void trackAllocatedResources(

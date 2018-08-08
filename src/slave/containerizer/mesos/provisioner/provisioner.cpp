@@ -52,7 +52,6 @@
 #include "slave/containerizer/mesos/provisioner/provisioner.hpp"
 #include "slave/containerizer/mesos/provisioner/store.hpp"
 
-using std::list;
 using std::string;
 using std::vector;
 
@@ -429,18 +428,20 @@ Future<Nothing> ProvisionerProcess::recover(
       VLOG(1) << "Layers path '" << path << "' is missing for container' "
               << containerId << "'";
     } else {
-      Try<ContainerLayers> layers = state::read<ContainerLayers>(path);
+      Result<ContainerLayers> layers = state::read<ContainerLayers>(path);
       if (layers.isError()) {
         return Failure(
             "Failed to recover layers for container '" +
             stringify(containerId) + "': " + layers.error());
       }
 
-      info->layers = vector<string>();
-      std::copy(
-          layers->paths().begin(),
-          layers->paths().end(),
-          std::back_inserter(info->layers.get()));
+      if (layers.isSome()) {
+        info->layers = vector<string>();
+        std::copy(
+            layers->paths().begin(),
+            layers->paths().end(),
+            std::back_inserter(info->layers.get()));
+      }
     }
 
     infos.put(containerId, info);
@@ -455,7 +456,7 @@ Future<Nothing> ProvisionerProcess::recover(
   }
 
   // Cleanup unknown orphan containers' rootfses.
-  list<Future<bool>> cleanups;
+  vector<Future<bool>> cleanups;
   foreach (const ContainerID& containerId, unknownContainerIds) {
     LOG(INFO) << "Cleaning up unknown container " << containerId;
 
@@ -471,7 +472,7 @@ Future<Nothing> ProvisionerProcess::recover(
     .then([]() -> Future<Nothing> { return Nothing(); });
 
   // Recover stores.
-  list<Future<Nothing>> recovers;
+  vector<Future<Nothing>> recovers;
   foreachvalue (const Owned<Store>& store, stores) {
     recovers.push_back(store->recover());
   }
@@ -623,7 +624,7 @@ Future<bool> ProvisionerProcess::destroy(const ContainerID& containerId)
       // TODO(gilbert): Move provisioner directory to the container
       // runtime directory after a deprecation cycle to avoid
       // making `provisioner::destroy()` being recursive.
-      list<Future<bool>> destroys;
+      vector<Future<bool>> destroys;
 
       foreachkey (const ContainerID& entry, infos) {
         if (entry.has_parent() && entry.parent() == containerId) {
@@ -642,7 +643,7 @@ Future<bool> ProvisionerProcess::destroy(const ContainerID& containerId)
 
 Future<bool> ProvisionerProcess::_destroy(
     const ContainerID& containerId,
-    const list<Future<bool>>& destroys)
+    const vector<Future<bool>>& destroys)
 {
   CHECK(infos.contains(containerId));
   CHECK(infos[containerId]->destroying);
@@ -666,7 +667,7 @@ Future<bool> ProvisionerProcess::_destroy(
 
   const Owned<Info>& info = infos[containerId];
 
-  list<Future<bool>> futures;
+  vector<Future<bool>> futures;
   foreachkey (const string& backend, info->rootfses) {
     if (!backends.contains(backend)) {
       return Failure("Unknown backend '" + backend + "'");
@@ -759,7 +760,7 @@ Future<Nothing> ProvisionerProcess::pruneImages(
         activeLayerPaths.insert(info->layers->begin(), info->layers->end());
       }
 
-      list<Future<Nothing>> futures;
+      vector<Future<Nothing>> futures;
 
       foreachpair (
           const Image::Type& type, const Owned<Store>& store, stores) {

@@ -70,12 +70,12 @@
 
           <li><a href="http://mesos.apache.org">Apache Mesos</a></li>
           <% if current_page.data.breadcrumb %>
-          <li><a href="/<%= current_page.data.breadcrumb.delete(' ').downcase %>/"><%= current_page.data.breadcrumb %></a></li>
+          <li><a href="/<%= current_page.data.breadcrumb.chomp.gsub(/\s+/, '-').downcase %>/"><%= current_page.data.breadcrumb %></a></li>
           <% elsif content_for?(:page_title) %>
           <% if yield_content(:page_title) == "Documentation" %>
           <li><a href="/documentation/latest/"><%= yield_content :page_title %></a></li>
           <% else %>
-          <li><a href="/<%= yield_content(:page_title).downcase %>/"><%= yield_content :page_title %></a></li>
+          <li><a href="/<%= yield_content(:page_title).downcase.chomp %>/"><%= yield_content(:page_title).chop %></a></li>
           <% end %>
           <% end %>
         </ul><!-- /.breadcrumb -->
@@ -87,7 +87,14 @@
     <!-- footer -->
     <div class="footer">
       <div class="container">
-        <div class="col-md-4 social-blk">
+
+        <div class="col-md-3">
+            <a  href="https://www.apache.org/events/current-event.html">
+              <img src="https://www.apache.org/events/current-event-234x60.png"/>
+            </a>
+        </div>
+
+        <div class="col-md-3 social-blk">
           <span class="social">
             <a href="https://twitter.com/ApacheMesos"
               class="twitter-follow-button"
@@ -101,11 +108,12 @@
           </span>
         </div>
 
-        <div class="col-md-8 trademark">
-          <p>&copy; 2012-2017 <a href="http://apache.org">The Apache Software Foundation</a>.
+        <div class="col-md-6 trademark">
+          <p>&copy; 2012-2018 <a href="http://apache.org">The Apache Software Foundation</a>.
             Apache Mesos, the Apache feather logo, and the Apache Mesos project logo are trademarks of The Apache Software Foundation.
           <p>
         </div>
+
       </div><!-- /.container -->
     </div><!-- /.footer -->
 

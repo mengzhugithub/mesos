@@ -53,18 +53,21 @@ CONCURRENTQUEUE = concurrentqueue-$(CONCURRENTQUEUE_VERSION)
 CSI = csi-$(CSI_VERSION)
 ELFIO = elfio-$(ELFIO_VERSION)
 GLOG = glog-$(GLOG_VERSION)
-GOOGLETEST = googletest-release-$(GOOGLETEST_VERSION)
 GMOCK = $(GOOGLETEST)/googlemock
+GOOGLETEST = googletest-release-$(GOOGLETEST_VERSION)
 GPERFTOOLS = gperftools-$(GPERFTOOLS_VERSION)
 GRPC = grpc-$(GRPC_VERSION)
 GTEST = $(GOOGLETEST)/googletest
 HTTP_PARSER = http-parser-$(HTTP_PARSER_VERSION)
+JEMALLOC = jemalloc-$(JEMALLOC_VERSION)
 LEVELDB = leveldb-$(LEVELDB_VERSION)
+LIBARCHIVE = libarchive-$(LIBARCHIVE_VERSION)
 LIBEV = libev-$(LIBEV_VERSION)
 NVML = nvml-$(NVML_VERSION)
 PIP = pip-$(PIP_VERSION)
-PROTOBUF = protobuf-$(PROTOBUF_VERSION)
 PICOJSON = picojson-$(PICOJSON_VERSION)
+PROTOBUF = protobuf-$(PROTOBUF_VERSION)
+RAPIDJSON = rapidjson-$(RAPIDJSON_VERSION)
 SETUPTOOLS = setuptools-$(SETUPTOOLS_VERSION)
 WHEEL = wheel-$(WHEEL_VERSION)
 ZOOKEEPER = zookeeper-$(ZOOKEEPER_VERSION)
@@ -79,12 +82,15 @@ EXTRA_DIST =			\
   $(GPERFTOOLS).tar.gz		\
   $(GRPC).tar.gz		\
   $(HTTP_PARSER).tar.gz		\
+  $(JEMALLOC).tar.gz		\
   $(LEVELDB).tar.gz		\
+  $(LIBARCHIVE).tar.gz		\
   $(LIBEV).tar.gz		\
   $(NVML).tar.gz		\
   $(PIP).tar.gz			\
   $(PROTOBUF).tar.gz		\
   $(PICOJSON).tar.gz		\
+  $(RAPIDJSON).tar.gz		\
   $(SETUPTOOLS).tar.gz		\
   $(WHEEL).tar.gz		\
   $(ZOOKEEPER).tar.gz
@@ -93,10 +99,6 @@ EXTRA_DIST =			\
 # compiling with clang (and C++11); see MESOS-860, MESOS-966.
 EXTRA_DIST +=		\
   $(GLOG).patch
-
-# We patch grpc for compilation issues. See `grpc-1.8.3.readme`.
-EXTRA_DIST +=		\
-  $(GRPC).patch
 
 # We need to patch leveldb to prevent it from linking to snappy and
 # tcmalloc; see MESOS-1054, MESOS-1624.
@@ -121,12 +123,15 @@ CLEAN_EXTRACTED =		\
   $(GPERFTOOLS)			\
   $(GRPC)			\
   $(HTTP_PARSER)		\
+  $(JEMALLOC)			\
   $(LEVELDB)			\
+  $(LIBARCHIVE)			\
   $(LIBEV)			\
   $(NVML)			\
   $(PIP)			\
   $(PICOJSON)			\
   $(PROTOBUF)			\
+  $(RAPIDJSON)			\
   $(SETUPTOOLS)			\
   $(WHEEL)			\
   $(ZOOKEEPER)
@@ -253,6 +258,47 @@ $(HTTP_PARSER)-build-stamp: libry_http_parser.la
 	touch $@
 endif
 
+
+if WITH_BUNDLED_JEMALLOC
+JEMALLOC_CONFIGURE_ARGS = \
+    --enable-stats --enable-prof --with-malloc-conf="prof:true,prof_active:false"
+
+LIB_JEMALLOC = $(JEMALLOC)/libjemalloc.la
+
+$(LIB_JEMALLOC): $(JEMALLOC)-build-stamp
+
+$(JEMALLOC)-build-stamp: $(JEMALLOC)-stamp
+	cd $(JEMALLOC) && ./configure $(JEMALLOC_CONFIGURE_ARGS) $(CONFIGURE_ARGS)
+	cd $(JEMALLOC) && $(MAKE) $(AM_MAKEFLAGS)
+	touch $@
+
+ALL_LOCAL += $(LIB_JEMALLOC)
+endif
+
+if WITH_BUNDLED_LIBARCHIVE
+LIB_LIBARCHIVE = $(LIBARCHIVE)/.libs/libarchive.la
+
+$(LIB_LIBARCHIVE): $(LIBARCHIVE)-build-stamp
+
+$(LIBARCHIVE)-build-stamp: $(LIBARCHIVE)-stamp
+	cd $(LIBARCHIVE) &&			\
+	  ./configure $(CONFIGURE_ARGS)		\
+	      --without-bz2lib			\
+	      --without-cng			\
+	      --without-expat			\
+	      --without-iconv			\
+	      --without-libiconv-prefix		\
+	      --without-lz4			\
+	      --without-lzma			\
+	      --without-nettle			\
+	      --without-openssl			\
+	      --without-xml2
+	cd $(LIBARCHIVE) && $(MAKE) $(AM_MAKEFLAGS)
+	touch $@
+
+ALL_LOCAL += $(LIB_LIBARCHIVE)
+endif
+
 if WITH_BUNDLED_LIBEV
 $(LIBEV)/libev.la: $(LIBEV)-build-stamp
 $(LIBEV)-build-stamp: $(LIBEV)-stamp
@@ -275,6 +321,68 @@ $(PICOJSON)/picojson.h: $(PICOJSON)-stamp
 ALL_LOCAL += $(PICOJSON)-stamp
 endif
 
+if WITH_BUNDLED_RAPIDJSON
+# Stout depends on rapidjson. Install rapidjson into $PREFIX/include
+# but don't add it to the source tarball.
+#
+# We need to use a variable per sub-directory in order to preserve
+# the subdirectory structure:
+#   https://www.gnu.org/software/automake/manual/html_node/Alternative.html
+rapidjsondir = $(includedir)/rapidjson
+rapidjsonerrordir = $(includedir)/rapidjson/error
+rapidjsoninternaldir = $(includedir)/rapidjson/internal
+rapidjsonmsinttypesdir = $(includedir)/rapidjson/msinttypes
+
+nodist_rapidjson_HEADERS =				\
+  $(RAPIDJSON)/include/rapidjson/allocators.h		\
+  $(RAPIDJSON)/include/rapidjson/document.h		\
+  $(RAPIDJSON)/include/rapidjson/encodedstream.h	\
+  $(RAPIDJSON)/include/rapidjson/encodings.h		\
+  $(RAPIDJSON)/include/rapidjson/filereadstream.h	\
+  $(RAPIDJSON)/include/rapidjson/filewritestream.h	\
+  $(RAPIDJSON)/include/rapidjson/fwd.h			\
+  $(RAPIDJSON)/include/rapidjson/istreamwrapper.h	\
+  $(RAPIDJSON)/include/rapidjson/memorybuffer.h		\
+  $(RAPIDJSON)/include/rapidjson/memorystream.h		\
+  $(RAPIDJSON)/include/rapidjson/ostreamwrapper.h	\
+  $(RAPIDJSON)/include/rapidjson/pointer.h		\
+  $(RAPIDJSON)/include/rapidjson/prettywriter.h		\
+  $(RAPIDJSON)/include/rapidjson/rapidjson.h		\
+  $(RAPIDJSON)/include/rapidjson/reader.h		\
+  $(RAPIDJSON)/include/rapidjson/schema.h		\
+  $(RAPIDJSON)/include/rapidjson/stream.h		\
+  $(RAPIDJSON)/include/rapidjson/stringbuffer.h		\
+  $(RAPIDJSON)/include/rapidjson/writer.h
+
+nodist_rapidjsonerror_HEADERS =				\
+  $(RAPIDJSON)/include/rapidjson/error/en.h		\
+  $(RAPIDJSON)/include/rapidjson/error/error.h
+
+nodist_rapidjsoninternal_HEADERS =			\
+  $(RAPIDJSON)/include/rapidjson/internal/biginteger.h	\
+  $(RAPIDJSON)/include/rapidjson/internal/diyfp.h	\
+  $(RAPIDJSON)/include/rapidjson/internal/dtoa.h	\
+  $(RAPIDJSON)/include/rapidjson/internal/ieee754.h	\
+  $(RAPIDJSON)/include/rapidjson/internal/itoa.h	\
+  $(RAPIDJSON)/include/rapidjson/internal/meta.h	\
+  $(RAPIDJSON)/include/rapidjson/internal/pow10.h	\
+  $(RAPIDJSON)/include/rapidjson/internal/regex.h	\
+  $(RAPIDJSON)/include/rapidjson/internal/stack.h	\
+  $(RAPIDJSON)/include/rapidjson/internal/strfunc.h	\
+  $(RAPIDJSON)/include/rapidjson/internal/strtod.h	\
+  $(RAPIDJSON)/include/rapidjson/internal/swap.h
+
+nodist_rapidjsonmsinttypes_HEADERS =			\
+  $(RAPIDJSON)/include/rapidjson/msinttypes/inttypes.h	\
+  $(RAPIDJSON)/include/rapidjson/msinttypes/stdint.h
+
+$(nodist_rapidjson_HEADERS): $(RAPIDJSON)-stamp
+$(nodist_rapidjsonerror_HEADERS): $(RAPIDJSON)-stamp
+$(nodist_rapidjsoninternal_HEADERS): $(RAPIDJSON)-stamp
+$(nodist_rapidjsonmsinttypes_HEADERS): $(RAPIDJSON)-stamp
+
+ALL_LOCAL += $(RAPIDJSON)-stamp
+endif
 
 if WITH_BUNDLED_PROTOBUF
 $(PROTOBUF)/src/protoc $(PROTOBUF)/src/libprotobuf.la: $(PROTOBUF)-build-stamp
@@ -305,35 +413,48 @@ PROTOBUF_LINKER_FLAGS = @PROTOBUF_LINKERFLAGS@
 PROTOC = @PROTOCOMPILER@
 endif
 
-if ENABLE_GRPC
+if !ENABLE_SSL
+GRPC_VARIANT = _unsecure
+endif
+
 if WITH_BUNDLED_GRPC
-LIB_GRPC = $(GRPC)/libs/opt/libgrpc++.a			\
-           $(GRPC)/libs/opt/libgrpc.a			\
+LIB_GRPC = $(GRPC)/libs/opt/libgrpc++$(GRPC_VARIANT).a	\
+           $(GRPC)/libs/opt/libgrpc$(GRPC_VARIANT).a	\
            $(GRPC)/libs/opt/libgpr.a
 
 $(LIB_GRPC): $(GRPC)-build-stamp
 
-# NOTE: The `-Wno-deprecated-declarations` flag is added so that gRPC
-# can be built with OpenSSL 1.1.0. See:
-# https://github.com/grpc/grpc/pull/11496
-# NOTE: The `-Wno-unused-function` flag is added to address errors when
-# compling `src/core/tsi/ssl_transport_security.cc`. See:
-# https://github.com/grpc/grpc/pull/11675
+# NOTE: We pass compiler flags through environment variables rather than the
+# command line because gRPC uses target-specific assignments to append compiler
+# flags, which will be overwritten by the command line. See:
+# https://www.gnu.org/software/make/manual/html_node/Target_002dspecific.html
+#
+# NOTE: We ignore `array-bounds` errors generated by the GLIBC's `__strcmp_cg`
+# macro used in gRPC's c-ares library when compiled with Clang.
 $(GRPC)-build-stamp: $(GRPC)-stamp			\
                      $(PROTOBUF)-build-stamp
 	cd $(GRPC) &&					\
-	  CPPFLAGS="-Wno-deprecated-declarations	\
-	            -Wno-unused-function		\
-	            $(PROTOBUF_INCLUDE_FLAGS)		\
+	  CPPFLAGS="$(PROTOBUF_INCLUDE_FLAGS)		\
 	            $(SSL_INCLUDE_FLAGS)		\
-	            $(ZLIB_INCLUDE_FLAGS)"		\
-	  LDFLAGS="$(PROTOBUF_LINKER_FLAGS)		\
-	           $(SSL_LINKER_FLAGS)			\
-	           $(ZLIB_LINKER_FLAGS)"		\
+	            $(ZLIB_INCLUDE_FLAGS)		\
+	            -Wno-array-bounds			\
+	            $(CPPFLAGS)"			\
+	  CFLAGS="$(CFLAGS)"				\
+	  CXXFLAGS="$(CXXFLAGS)"			\
 	  $(MAKE) $(AM_MAKEFLAGS)			\
-	          HAS_PKG_CONFIG=false			\
-	          NO_PROTOC=false			\
-	          PROTOC=$(PROTOC)
+	    $(LIB_GRPC:%=$(abs_builddir)/%)		\
+	    CC="$(CC)"					\
+	    CXX="$(CXX)"				\
+	    LD="$(CC)"					\
+	    LDXX="$(CXX)"				\
+	    LDFLAGS="$(PROTOBUF_LINKER_FLAGS)		\
+	             $(SSL_LINKER_FLAGS)		\
+	             $(ZLIB_LINKER_FLAGS)		\
+	             $(LDFLAGS)"			\
+	    LDLIBS="$(LDLIBS)"				\
+	    HAS_PKG_CONFIG=false			\
+	    NO_PROTOC=false				\
+	    PROTOC="$(PROTOC)"
 	touch $@
 
 ALL_LOCAL += $(LIB_GRPC)
@@ -341,11 +462,10 @@ else
 $(GRPC)-build-stamp:
 	touch $@
 endif
-endif
 
-if ENABLE_GRPC
+# NOTE: We extract `csi.proto` even if gRPC is disabled because it is
+# imported by other proto files.
 ALL_LOCAL += $(CSI)-stamp
-endif
 
 # Convenience library for gmock/gtest.
 check_LTLIBRARIES = libgmock.la
@@ -452,6 +572,13 @@ endif
 if WITH_BUNDLED_PROTOBUF
 	cd $(PROTOBUF) && \
 	  $(MAKE) $(AM_MAKEFLAGS) DESTDIR=$(INSTALLDIR) install
+endif
+if WITH_BUNDLED_RAPIDJSON
+# TODO(bmahler): Rapidjson has a cmake build, can we just cmake install
+# instead of copying?
+	@test -d $(INSTALLDIR)/include/rapidjson || \
+	  rm -rf $(INSTALLDIR)/include/rapidjson
+	cp -fpR $(RAPIDJSON)/include/rapidjson $(INSTALLDIR)/include/
 endif
 if WITH_BUNDLED_ZOOKEEPER
 	cd $(ZOOKEEPER)/src/c && \

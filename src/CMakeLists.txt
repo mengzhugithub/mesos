@@ -18,12 +18,23 @@
 #########################################
 include(MesosProtobuf)
 
+set(PUBLIC_PROTO_PATH "")
+set(PUBLIC_PROTOBUF_INCLUDE_DIR "")
+set(PUBLIC_PROTOBUF_SRC "")
+set(INTERNAL_PROTO_PATH "")
+set(INTERNAL_PROTOBUF_INCLUDE_DIR "")
+set(INTERNAL_PROTOBUF_SRC "")
+set(JAVA_PROTOBUF_SRC "")
+
 # Build the protobuf structs.
 #
-# NOTE: `PROTOC_GENERATE` will list append to `PUBLIC_PROTOBUF_SRC`,
-# `INTERNAL_PROTOBUF_SRC`, and/or `JAVA_PROTOBUF_SRC` depending on the
-# `INTERNAL` and `JAVA` options.
-set(PUBLIC_PROTOBUF_SRC "")
+# NOTE: The following `PROTOC_GENERATE` calls will list append to
+# `PUBLIC_PROTO_PATH`, `PUBLIC_PROTOBUF_INCLUDE_DIR` and `PUBLIC_PROTOBUF_SRC`.
+# The GRPC option is a noop if gRPC is disabled.
+PROTOC_GENERATE(GRPC LIB csi TARGET csi)
+
+# NOTE: The following `PROTOC_GENERATE` calls will list append to
+# `PUBLIC_PROTOBUF_SRC`.
 PROTOC_GENERATE(TARGET mesos/agent/agent)
 PROTOC_GENERATE(TARGET mesos/allocator/allocator)
 PROTOC_GENERATE(TARGET mesos/appc/spec)
@@ -45,8 +56,9 @@ PROTOC_GENERATE(TARGET mesos/slave/oversubscription)
 PROTOC_GENERATE(TARGET mesos/state/state)
 PROTOC_GENERATE(TARGET mesos/uri/uri)
 
-# NOTE: The JAVA option is a noop if Java is disabled.
-set(JAVA_PROTOBUF_SRC "")
+# NOTE: The following `PROTOC_GENERATE` calls will list append to
+# `PUBLIC_PROTOBUF_SRC` and/or `JAVA_PROTOBUF_SRC`. The JAVA option is a noop if
+# Java is disabled.
 PROTOC_GENERATE(JAVA TARGET mesos/executor/executor)
 PROTOC_GENERATE(JAVA TARGET mesos/fetcher/fetcher)
 PROTOC_GENERATE(JAVA TARGET mesos/mesos)
@@ -61,7 +73,8 @@ PROTOC_GENERATE(JAVA TARGET mesos/v1/quota/quota)
 PROTOC_GENERATE(JAVA TARGET mesos/v1/resource_provider/resource_provider)
 PROTOC_GENERATE(JAVA TARGET mesos/v1/scheduler/scheduler)
 
-set(INTERNAL_PROTOBUF_SRC "")
+# NOTE: The following `PROTOC_GENERATE` calls will list append to
+# `INTERNAL_PROTOBUF_SRC`.
 PROTOC_GENERATE(INTERNAL TARGET messages/flags)
 PROTOC_GENERATE(INTERNAL TARGET messages/log)
 PROTOC_GENERATE(INTERNAL TARGET messages/messages)
@@ -72,6 +85,8 @@ PROTOC_GENERATE(INTERNAL TARGET slave/containerizer/mesos/provisioner/docker/mes
 PROTOC_GENERATE(INTERNAL TARGET master/registry)
 PROTOC_GENERATE(INTERNAL TARGET resource_provider/registry)
 PROTOC_GENERATE(INTERNAL TARGET resource_provider/state)
+PROTOC_GENERATE(INTERNAL TARGET resource_provider/storage/disk_profile)
+PROTOC_GENERATE(INTERNAL TARGET csi/state)
 
 
 # BUILD PROTOBUFS.
@@ -92,9 +107,18 @@ add_library(
   ${PUBLIC_PROTOBUF_SRC}
   ${INTERNAL_PROTOBUF_SRC})
 
-target_link_libraries(mesos-protobufs PUBLIC protobuf)
+target_link_libraries(mesos-protobufs PUBLIC
+  protobuf
+  grpc)
+
 target_include_directories(
-  mesos-protobufs PUBLIC ${MESOS_PROTOBUF_HEADER_INCLUDE_DIRS})
+  mesos-protobufs
+  PUBLIC
+  ${MESOS_PROTOBUF_HEADER_INCLUDE_DIRS}
+  ${PUBLIC_PROTOBUF_INCLUDE_DIR}
+
+  PRIVATE
+  ${INTERNAL_PROTOBUF_INCLUDE_DIR})
 
 
 # BUILD JAVA ARTIFACTS.
@@ -151,7 +175,7 @@ set(AGENT_SRC
   slave/containerizer/mesos/provisioner/appc/paths.cpp
   slave/containerizer/mesos/provisioner/appc/store.cpp
   slave/containerizer/mesos/provisioner/backends/copy.cpp
-  slave/containerizer/mesos/provisioner/docker/local_puller.cpp
+  slave/containerizer/mesos/provisioner/docker/image_tar_puller.cpp
   slave/containerizer/mesos/provisioner/docker/metadata_manager.cpp
   slave/containerizer/mesos/provisioner/docker/paths.cpp
   slave/containerizer/mesos/provisioner/docker/puller.cpp
@@ -212,6 +236,12 @@ set(COMMON_SRC
   common/validation.cpp
   common/values.cpp)
 
+set(CSI_SRC
+  csi/client.cpp
+  csi/paths.cpp
+  csi/rpc.cpp
+  csi/utils.cpp)
+
 set(DOCKER_SRC
   docker/docker.cpp
   docker/spec.cpp)
@@ -269,6 +299,7 @@ set(LINUX_SRC
   slave/containerizer/mesos/isolators/gpu/nvml.cpp
   slave/containerizer/mesos/isolators/gpu/volume.cpp
   slave/containerizer/mesos/isolators/linux/capabilities.cpp
+  slave/containerizer/mesos/isolators/linux/devices.cpp
   slave/containerizer/mesos/isolators/namespaces/ipc.cpp
   slave/containerizer/mesos/isolators/namespaces/pid.cpp
   slave/containerizer/mesos/isolators/network/cni/cni.cpp
@@ -278,6 +309,38 @@ set(LINUX_SRC
   slave/containerizer/mesos/provisioner/backends/aufs.cpp
   slave/containerizer/mesos/provisioner/backends/bind.cpp
   slave/containerizer/mesos/provisioner/backends/overlay.cpp)
+
+if (ENABLE_XFS_DISK_ISOLATOR)
+  list(APPEND LINUX_SRC
+    slave/containerizer/mesos/isolators/xfs/disk.cpp
+    slave/containerizer/mesos/isolators/xfs/utils.cpp)
+endif ()
+
+if (ENABLE_LINUX_ROUTING)
+  list(APPEND LINUX_SRC
+    linux/routing/handle.cpp
+    linux/routing/route.cpp
+    linux/routing/utils.cpp
+    linux/routing/diagnosis/diagnosis.cpp
+    linux/routing/filter/basic.cpp
+    linux/routing/filter/icmp.cpp
+    linux/routing/filter/ip.cpp
+    linux/routing/link/link.cpp
+    linux/routing/link/veth.cpp
+    linux/routing/queueing/fq_codel.cpp
+    linux/routing/queueing/htb.cpp
+    linux/routing/queueing/ingress.cpp)
+endif ()
+
+if (ENABLE_NETWORK_PORTS_ISOLATOR)
+  list(APPEND LINUX_SRC
+    slave/containerizer/mesos/isolators/network/ports.cpp)
+endif ()
+
+if (ENABLE_PORT_MAPPING_ISOLATOR)
+  list(APPEND LINUX_SRC
+    slave/containerizer/mesos/isolators/network/port_mapping.cpp)
+endif()
 
 set(LOCAL_SRC
   local/local.cpp)
@@ -304,6 +367,7 @@ set(LOGGING_SRC
 set(MASTER_SRC
   master/constants.cpp
   master/flags.cpp
+  master/framework.cpp
   master/http.cpp
   master/maintenance.cpp
   master/master.cpp
@@ -320,6 +384,7 @@ set(MASTER_SRC
   master/allocator/mesos/metrics.cpp
   master/allocator/sorter/drf/metrics.cpp
   master/allocator/sorter/drf/sorter.cpp
+  master/allocator/sorter/random/sorter.cpp
   master/contender/contender.cpp
   master/contender/standalone.cpp
   master/contender/zookeeper.cpp
@@ -347,7 +412,16 @@ set(RESOURCE_PROVIDER_SRC
   resource_provider/local.cpp
   resource_provider/manager.cpp
   resource_provider/registrar.cpp
-  resource_provider/validation.cpp)
+  resource_provider/validation.cpp
+  resource_provider/storage/disk_profile_adaptor.cpp
+  resource_provider/storage/disk_profile_utils.cpp)
+
+# NOTE: The storage local resource provider uses Unix domain sockets to talk to
+# CSI plugins, thus it is currently not supported on Windows.
+if (NOT WIN32)
+  list(APPEND RESOURCE_PROVIDER_SRC
+    resource_provider/storage/provider.cpp)
+endif ()
 
 set(SCHEDULER_SRC
   sched/sched.cpp
@@ -359,9 +433,6 @@ set(SECRET_SRC
 set(STATE_SRC
   state/in_memory.cpp)
 
-set(STATUS_UPDATE_MANAGER_SRC
-  status_update_manager/operation.cpp)
-
 if (NOT WIN32)
   list(APPEND STATE_SRC
     state/leveldb.cpp
@@ -369,16 +440,19 @@ if (NOT WIN32)
     state/zookeeper.cpp)
 endif ()
 
+set(STATUS_UPDATE_MANAGER_SRC
+  status_update_manager/operation.cpp)
+
 set(URI_SRC
   uri/fetcher.cpp
   uri/utils.cpp
   uri/fetchers/copy.cpp
-  uri/fetchers/curl.cpp)
+  uri/fetchers/curl.cpp
+  uri/fetchers/hadoop.cpp)
 
 if (NOT WIN32)
   list(APPEND URI_SRC
-    uri/fetchers/docker.cpp
-    uri/fetchers/hadoop.cpp)
+    uri/fetchers/docker.cpp)
 endif ()
 
 set(USAGE_SRC
@@ -414,6 +488,7 @@ set(MESOS_SRC
   ${AUTHENTICATION_SRC}
   ${AUTHORIZER_SRC}
   ${COMMON_SRC}
+  ${CSI_SRC}
   ${DOCKER_SRC}
   ${EXECUTOR_SRC}
   ${FILES_SRC}
@@ -445,6 +520,9 @@ if (NOT WIN32)
 endif ()
 
 # Include source for linux build.
+#
+# TODO(andschwa): Make this conditional happen sooner, instead of
+# here, and remove unnecessary variables.
 if (LINUX)
   list(APPEND MESOS_SRC ${LINUX_SRC})
 endif ()
@@ -478,15 +556,17 @@ set_target_properties(
   VERSION ${MESOS_PACKAGE_VERSION}
   SOVERSION ${MESOS_PACKAGE_SOVERSION})
 
-target_compile_definitions(mesos PUBLIC USE_CMAKE_BUILD_CONFIG)
+target_compile_definitions(
+  mesos PUBLIC
+  USE_CMAKE_BUILD_CONFIG
+  $<$<BOOL:${ENABLE_XFS_DISK_ISOLATOR}>:ENABLE_XFS_DISK_ISOLATOR>
+  $<$<BOOL:${ENABLE_PORT_MAPPING_ISOLATOR}>:ENABLE_PORT_MAPPING_ISOLATOR>
+  $<$<BOOL:${ENABLE_NETWORK_PORTS_ISOLATOR}>:ENABLE_NETWORK_PORTS_ISOLATOR>)
 
 target_include_directories(
   mesos PUBLIC
   ${MESOS_PUBLIC_INCLUDE_DIR}
-
-  # Contains (e.g.) compiled *.pb.h files.
   ${MESOS_BIN_INCLUDE_DIR}
-  ${MESOS_BIN_INCLUDE_DIR}/mesos
   ${MESOS_BIN_SRC_DIR}
   ${MESOS_SRC_DIR})
 
@@ -512,7 +592,6 @@ if (ENABLE_PRECOMPILED_HEADERS)
   cotire(mesos)
 endif ()
 
-
 # BUILD THE MESOS EXECUTABLES.
 ##############################
 add_subdirectory(checks)
@@ -523,6 +602,10 @@ add_subdirectory(launcher)
 add_subdirectory(local)
 add_subdirectory(log)
 add_subdirectory(master)
+add_subdirectory(python/cli_new)
+add_subdirectory(python/executor)
+add_subdirectory(python/scheduler)
+add_subdirectory(resource_provider/storage)
 add_subdirectory(slave)
 add_subdirectory(slave/containerizer/mesos)
 add_subdirectory(usage)
@@ -531,3 +614,4 @@ add_subdirectory(usage)
 # BUILD THE MESOS TESTS.
 ########################
 add_subdirectory(tests)
+add_subdirectory(python/cli_new/tests)

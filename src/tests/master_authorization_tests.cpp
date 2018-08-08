@@ -1137,7 +1137,7 @@ TEST_F(MasterAuthorizationTest, DuplicateRegistration)
 // This test verifies that an authentication request that comes from
 // the same instance of the framework (e.g., ZK blip) before
 // 'Master::_reregisterFramework()' from an earlier attempt, causes
-// the master to successfully re-register the framework.
+// the master to successfully reregister the framework.
 TEST_F(MasterAuthorizationTest, DuplicateReregistration)
 {
   MockAuthorizer authorizer;
@@ -1304,7 +1304,7 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeReregistration)
 
   EXPECT_CALL(sched, disconnected(&driver));
 
-  // Framework should not be re-registered.
+  // Framework should not be reregistered.
   EXPECT_CALL(sched, reregistered(&driver, _))
     .Times(0);
 
@@ -2173,7 +2173,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterRolesEndpoint)
 // default users are allowed to to view high level frameworks, but
 // only one is allowed to view the tasks. Although the tasks are
 // "orphaned" (in the sense that their framework has not yet
-// re-registered), they are now reported under the "tasks" key.
+// reregistered), they are now reported under the "tasks" key.
 TYPED_TEST(MasterAuthorizerTest, FilterOrphanedTasks)
 {
   ACLs acls;
@@ -2280,7 +2280,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterOrphanedTasks)
   // Simulate a new master detected event to the slave.
   detector.appoint(master.get()->pid);
 
-  // The framework will not re-register with the new master as the
+  // The framework will not reregister with the new master as the
   // scheduler is bound to the old master pid.
 
   AWAIT_READY(slaveReregisteredMessage);
@@ -2390,10 +2390,12 @@ TEST_F(MasterAuthorizationTest, AuthorizedToRegisterAndReregisterAgent)
 }
 
 
-// This test verifies that the agent is shut down by the master if
-// it is not authorized to register.
+// This test verifies that an agent without the right ACLs
+// is not allowed to register and is not shut down.
 TEST_F(MasterAuthorizationTest, UnauthorizedToRegisterAgent)
 {
+  Clock::pause();
+
   // Set up ACLs that disallows the agent's principal to register.
   ACLs acls;
   mesos::ACL::RegisterAgent* acl = acls.add_register_agents();
@@ -2406,19 +2408,36 @@ TEST_F(MasterAuthorizationTest, UnauthorizedToRegisterAgent)
   Try<Owned<cluster::Master>> master = StartMaster(flags);
   ASSERT_SOME(master);
 
-  Future<Message> shutdownMessage =
-    FUTURE_MESSAGE(Eq(ShutdownMessage().GetTypeName()), _, _);
+  // Previously, agents were shut down when registration failed due to
+  // authorization. We verify that this no longer occurs.
+  EXPECT_NO_FUTURE_PROTOBUFS(ShutdownMessage(), _, _);
+
+  // We verify that the agent isn't allowed to register.
+  EXPECT_NO_FUTURE_PROTOBUFS(SlaveRegisteredMessage(), _, _);
+
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    FUTURE_PROTOBUF(RegisterSlaveMessage(), _, _);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
   ASSERT_SOME(slave);
 
-  AWAIT_READY(shutdownMessage);
+  // Advance the clock to trigger the registration attempt.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+
+  AWAIT_READY(registerSlaveMessage);
+
+  // Settle to make sure neither `SlaveRegisteredMessage` nor
+  // `ShutdownMessage` are sent.
+  Clock::settle();
 }
 
 
 // This test verifies that an agent authorized to register can be
-// unauthorized to re-register due to master ACL change (after failover).
+// unauthorized to reregister due to master ACL change (after failover).
 TEST_F(MasterAuthorizationTest, UnauthorizedToReregisterAgent)
 {
   // Set up ACLs so that the agent can register.
@@ -2433,12 +2452,14 @@ TEST_F(MasterAuthorizationTest, UnauthorizedToReregisterAgent)
   Try<Owned<cluster::Master>> master = StartMaster(flags);
   ASSERT_SOME(master);
 
-  slave::Flags slaveFlags = CreateSlaveFlags();
+  // Previously, agents were shut down when registration failed due to
+  // authorization. We verify that this no longer occurs.
+  EXPECT_NO_FUTURE_PROTOBUFS(ShutdownMessage(), _, _);
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
   StandaloneMasterDetector detector(master.get()->pid);
-
-  Future<Message> slaveRegisteredMessage =
-    FUTURE_MESSAGE(Eq(SlaveRegisteredMessage().GetTypeName()), _, _);
-
   Try<Owned<cluster::Slave>> slave = StartSlave(&detector);
   ASSERT_SOME(slave);
 
@@ -2447,19 +2468,27 @@ TEST_F(MasterAuthorizationTest, UnauthorizedToReregisterAgent)
   // Master fails over.
   master->reset();
 
-  // The new master doesn't allow this agent principal to re-register.
+  // The new master doesn't allow this agent principal to reregister.
   acl->mutable_agents()->set_type(ACL::Entity::NONE);
   flags.acls = acls;
 
-  Future<Message> shutdownMessage =
-    FUTURE_MESSAGE(Eq(ShutdownMessage().GetTypeName()), _, _);
+  // The agent should try but not be able to reregister.
+  Future<ReregisterSlaveMessage> reregisterSlaveMessage =
+    FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
+
+  EXPECT_NO_FUTURE_PROTOBUFS(SlaveReregisteredMessage(), _, _);
 
   master = StartMaster(flags);
   ASSERT_SOME(master);
 
   detector.appoint(master.get()->pid);
 
-  AWAIT_READY(shutdownMessage);
+  AWAIT_READY(reregisterSlaveMessage);
+
+  // Settle to make sure neither `SlaveReregisteredMessage` nor
+  // `ShutdownMessage` are sent.
+  Clock::pause();
+  Clock::settle();
 }
 
 
@@ -2512,10 +2541,12 @@ TEST_F(MasterAuthorizationTest, RetryRegisterAgent)
 }
 
 
-// This test verifies that the agent is shut down by the master if it is
-// not authorized to statically reserve any resources.
+// This test verifies that the agent is not allowed to register if it tries to
+// statically reserve resources, but it is not allowed to.
 TEST_F(MasterAuthorizationTest, UnauthorizedToStaticallyReserveResources)
 {
+  Clock::pause();
+
   // Set up ACLs so that the agent can (re)register.
   ACLs acls;
 
@@ -2538,8 +2569,15 @@ TEST_F(MasterAuthorizationTest, UnauthorizedToStaticallyReserveResources)
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
-  Future<Message> shutdownMessage =
-    FUTURE_MESSAGE(Eq(ShutdownMessage().GetTypeName()), _, _);
+  // Previously, agents were shut down when registration failed due to
+  // authorization. We verify that this no longer occurs.
+  EXPECT_NO_FUTURE_PROTOBUFS(ShutdownMessage(), _, _);
+
+  // We verify that the agent isn't allowed to register.
+  EXPECT_NO_FUTURE_PROTOBUFS(SlaveRegisteredMessage(), _, _);
+
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    FUTURE_PROTOBUF(RegisterSlaveMessage(), _, _);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 
@@ -2549,7 +2587,15 @@ TEST_F(MasterAuthorizationTest, UnauthorizedToStaticallyReserveResources)
   Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), agentFlags);
   ASSERT_SOME(agent);
 
-  AWAIT_READY(shutdownMessage);
+  // Advance the clock to trigger the registration attempt.
+  Clock::advance(agentFlags.registration_backoff_factor);
+  Clock::settle();
+
+  AWAIT_READY(registerSlaveMessage);
+
+  // Settle to make sure neither `SlaveRegisteredMessage` nor
+  // `ShutdownMessage` are sent.
+  Clock::settle();
 }
 
 
@@ -2557,6 +2603,8 @@ TEST_F(MasterAuthorizationTest, UnauthorizedToStaticallyReserveResources)
 // not authorized to statically reserve certain roles.
 TEST_F(MasterAuthorizationTest, UnauthorizedToStaticallyReserveRole)
 {
+  Clock::pause();
+
   // Set up ACLs so that the agent can (re)register.
   ACLs acls;
 
@@ -2587,8 +2635,15 @@ TEST_F(MasterAuthorizationTest, UnauthorizedToStaticallyReserveRole)
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
-  Future<Message> shutdownMessage =
-    FUTURE_MESSAGE(Eq(ShutdownMessage().GetTypeName()), _, _);
+  // Previously, agents were shut down when registration failed due to
+  // authorization. We verify that this no longer occurs.
+  EXPECT_NO_FUTURE_PROTOBUFS(ShutdownMessage(), _, _);
+
+  // We verify that the agent isn't allowed to register.
+  EXPECT_NO_FUTURE_PROTOBUFS(SlaveRegisteredMessage(), _, _);
+
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    FUTURE_PROTOBUF(RegisterSlaveMessage(), _, _);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 
@@ -2598,7 +2653,15 @@ TEST_F(MasterAuthorizationTest, UnauthorizedToStaticallyReserveRole)
   Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), agentFlags);
   ASSERT_SOME(agent);
 
-  AWAIT_READY(shutdownMessage);
+  // Advance the clock to trigger the registration attempt.
+  Clock::advance(agentFlags.registration_backoff_factor);
+  Clock::settle();
+
+  AWAIT_READY(registerSlaveMessage);
+
+  // Settle to make sure neither `SlaveRegisteredMessage` nor
+  // `ShutdownMessage` are sent.
+  Clock::settle();
 }
 
 

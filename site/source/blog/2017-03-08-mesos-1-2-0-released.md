@@ -21,7 +21,7 @@ The latest Mesos release, 1.2.0, is now available for [download](/downloads). Th
     The isolator adds support for setting POSIX resource limits (rlimits) for
     containers launched using the Mesos containerizer. POSIX rlimits can be used
     to control the resources a process can consume. See
-    [docs](/documentation/latest/posix_rlimits) for details.
+    [docs](/documentation/latest/isolators/posix-rlimits/) for details.
 
   * [MESOS-6419](https://issues.apache.org/jira/browse/MESOS-6419) -
     **Experimental**: Teardown unregistered frameworks. The master
@@ -49,7 +49,7 @@ The latest Mesos release, 1.2.0, is now available for [download](/downloads). Th
     note that the AWS ECS uses Basic authorization but it does not work yet due to
     the redirect issue [MESOS-5172](https://issues.apache.org/jira/browse/MESOS-5172).
 
-More than 200 other bug fixes and improvements made it into this release. For full release notes with all features and bug fixes, please refer to the [CHANGELOG](https://git-wip-us.apache.org/repos/asf?p=mesos.git;a=blob_plain;f=CHANGELOG;hb=1.2.0).
+More than 200 other bug fixes and improvements made it into this release. For full release notes with all features and bug fixes, please refer to the [CHANGELOG](https://gitbox.apache.org/repos/asf?p=mesos.git;a=blob_plain;f=CHANGELOG;hb=1.2.0).
 
 ### Upgrades
 

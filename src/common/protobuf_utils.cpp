@@ -63,6 +63,8 @@ using std::vector;
 using google::protobuf::Map;
 using google::protobuf::RepeatedPtrField;
 
+using mesos::authorization::VIEW_ROLE;
+
 using mesos::slave::ContainerLimitation;
 using mesos::slave::ContainerState;
 
@@ -146,8 +148,8 @@ StatusUpdate createStatusUpdate(
   status->set_timestamp(update.timestamp());
 
   if (uuid.isSome()) {
-    update.set_uuid(uuid.get().toBytes());
-    status->set_uuid(uuid.get().toBytes());
+    update.set_uuid(uuid->toBytes());
+    status->set_uuid(uuid->toBytes());
   }
 
   if (reason.isSome()) {
@@ -406,8 +408,12 @@ bool isTerminalState(const OperationState& state)
     case OPERATION_ERROR:
     case OPERATION_DROPPED:
       return true;
-    case OPERATION_PENDING:
     case OPERATION_UNSUPPORTED:
+    case OPERATION_PENDING:
+    case OPERATION_UNREACHABLE:
+    case OPERATION_GONE_BY_OPERATOR:
+    case OPERATION_RECOVERING:
+    case OPERATION_UNKNOWN:
       return false;
   }
 
@@ -438,7 +444,7 @@ OperationStatus createOperationStatus(
   }
 
   if (uuid.isSome()) {
-    status.mutable_uuid()->set_value(uuid->toBytes());
+    status.mutable_uuid()->CopyFrom(protobuf::createUUID(uuid.get()));
   }
 
   return status;
@@ -450,7 +456,7 @@ Operation createOperation(
     const OperationStatus& latestStatus,
     const Option<FrameworkID>& frameworkId,
     const Option<SlaveID>& slaveId,
-    const Option<id::UUID>& operationUUID)
+    const Option<UUID>& operationUUID)
 {
   Operation operation;
   if (frameworkId.isSome()) {
@@ -462,9 +468,9 @@ Operation createOperation(
   operation.mutable_info()->CopyFrom(info);
   operation.mutable_latest_status()->CopyFrom(latestStatus);
   if (operationUUID.isSome()) {
-    operation.mutable_uuid()->set_value(operationUUID->toBytes());
+    operation.mutable_uuid()->CopyFrom(operationUUID.get());
   } else {
-    operation.mutable_uuid()->set_value(id::UUID::random().toBytes());
+    operation.mutable_uuid()->CopyFrom(protobuf::createUUID());
   }
 
   return operation;
@@ -472,7 +478,7 @@ Operation createOperation(
 
 
 UpdateOperationStatusMessage createUpdateOperationStatusMessage(
-    const id::UUID& operationUUID,
+    const UUID& operationUUID,
     const OperationStatus& status,
     const Option<OperationStatus>& latestStatus,
     const Option<FrameworkID>& frameworkId,
@@ -489,9 +495,23 @@ UpdateOperationStatusMessage createUpdateOperationStatusMessage(
   if (latestStatus.isSome()) {
     update.mutable_latest_status()->CopyFrom(latestStatus.get());
   }
-  update.mutable_operation_uuid()->set_value(operationUUID.toBytes());
+  update.mutable_operation_uuid()->CopyFrom(operationUUID);
 
   return update;
+}
+
+
+UUID createUUID(const Option<id::UUID>& uuid)
+{
+  UUID uuid_;
+
+  if (uuid.isSome()) {
+    uuid_.set_value(uuid->toBytes());
+  } else {
+    uuid_.set_value(id::UUID::random().toBytes());
+  }
+
+  return uuid_;
 }
 
 
@@ -520,7 +540,7 @@ MasterInfo createMasterInfo(const UPID& pid)
   // be fixed. See MESOS-1201 for more details.
   // TODO(marco): `ip` and `port` are deprecated in favor of `address`;
   //     remove them both after the deprecation cycle.
-  info.set_ip(pid.address.ip.in().get().s_addr);
+  info.set_ip(pid.address.ip.in()->s_addr);
   info.set_port(pid.address.port);
 
   info.mutable_address()->set_ip(stringify(pid.address.ip));
@@ -687,33 +707,37 @@ void injectAllocationInfo(
       break;
     }
 
-    case Offer::Operation::CREATE_VOLUME: {
+    case Offer::Operation::GROW_VOLUME: {
       inject(
-          *operation->mutable_create_volume()->mutable_source(),
+          *operation->mutable_grow_volume()->mutable_volume(),
+          allocationInfo);
+
+      inject(
+          *operation->mutable_grow_volume()->mutable_addition(),
           allocationInfo);
 
       break;
     }
 
-    case Offer::Operation::DESTROY_VOLUME: {
+    case Offer::Operation::SHRINK_VOLUME: {
       inject(
-          *operation->mutable_destroy_volume()->mutable_volume(),
+          *operation->mutable_shrink_volume()->mutable_volume(),
           allocationInfo);
 
       break;
     }
 
-    case Offer::Operation::CREATE_BLOCK: {
+    case Offer::Operation::CREATE_DISK: {
       inject(
-          *operation->mutable_create_block()->mutable_source(),
+          *operation->mutable_create_disk()->mutable_source(),
           allocationInfo);
 
       break;
     }
 
-    case Offer::Operation::DESTROY_BLOCK: {
+    case Offer::Operation::DESTROY_DISK: {
       inject(
-          *operation->mutable_destroy_block()->mutable_block(),
+          *operation->mutable_destroy_disk()->mutable_source(),
           allocationInfo);
 
       break;
@@ -802,26 +826,27 @@ void stripAllocationInfo(Offer::Operation* operation)
       break;
     }
 
-    case Offer::Operation::CREATE_VOLUME: {
-      strip(*operation->mutable_create_volume()->mutable_source());
+    case Offer::Operation::GROW_VOLUME: {
+      strip(*operation->mutable_grow_volume()->mutable_volume());
+      strip(*operation->mutable_grow_volume()->mutable_addition());
 
       break;
     }
 
-    case Offer::Operation::DESTROY_VOLUME: {
-      strip(*operation->mutable_destroy_volume()->mutable_volume());
+    case Offer::Operation::SHRINK_VOLUME: {
+      strip(*operation->mutable_shrink_volume()->mutable_volume());
 
       break;
     }
 
-    case Offer::Operation::CREATE_BLOCK: {
-      strip(*operation->mutable_create_block()->mutable_source());
+    case Offer::Operation::CREATE_DISK: {
+      strip(*operation->mutable_create_disk()->mutable_source());
 
       break;
     }
 
-    case Offer::Operation::DESTROY_BLOCK: {
-      strip(*operation->mutable_destroy_block()->mutable_block());
+    case Offer::Operation::DESTROY_DISK: {
+      strip(*operation->mutable_destroy_disk()->mutable_source());
 
       break;
     }
@@ -837,15 +862,18 @@ bool isSpeculativeOperation(const Offer::Operation& operation)
   switch (operation.type()) {
     case Offer::Operation::LAUNCH:
     case Offer::Operation::LAUNCH_GROUP:
-    case Offer::Operation::CREATE_VOLUME:
-    case Offer::Operation::DESTROY_VOLUME:
-    case Offer::Operation::CREATE_BLOCK:
-    case Offer::Operation::DESTROY_BLOCK:
+    case Offer::Operation::CREATE_DISK:
+    case Offer::Operation::DESTROY_DISK:
       return false;
     case Offer::Operation::RESERVE:
     case Offer::Operation::UNRESERVE:
     case Offer::Operation::CREATE:
     case Offer::Operation::DESTROY:
+    // TODO(zhitao): Convert `GROW_VOLUME` and `SHRINK_VOLUME` to
+    // non-speculative operations once we can support non-speculative operator
+    // API.
+    case Offer::Operation::GROW_VOLUME:
+    case Offer::Operation::SHRINK_VOLUME:
       return true;
     case Offer::Operation::UNKNOWN:
       UNREACHABLE();
@@ -856,30 +884,30 @@ bool isSpeculativeOperation(const Offer::Operation& operation)
 
 
 RepeatedPtrField<ResourceVersionUUID> createResourceVersions(
-    const hashmap<Option<ResourceProviderID>, id::UUID>& resourceVersions)
+    const hashmap<Option<ResourceProviderID>, UUID>& resourceVersions)
 {
   RepeatedPtrField<ResourceVersionUUID> result;
 
   foreachpair (
       const Option<ResourceProviderID>& resourceProviderId,
-      const id::UUID& uuid,
+      const UUID& uuid,
       resourceVersions) {
     ResourceVersionUUID* entry = result.Add();
 
     if (resourceProviderId.isSome()) {
       entry->mutable_resource_provider_id()->CopyFrom(resourceProviderId.get());
     }
-    entry->mutable_uuid()->set_value(uuid.toBytes());
+    entry->mutable_uuid()->CopyFrom(uuid);
   }
 
   return result;
 }
 
 
-hashmap<Option<ResourceProviderID>, id::UUID> parseResourceVersions(
+hashmap<Option<ResourceProviderID>, UUID> parseResourceVersions(
     const RepeatedPtrField<ResourceVersionUUID>& resourceVersionUUIDs)
 {
-  hashmap<Option<ResourceProviderID>, id::UUID> result;
+  hashmap<Option<ResourceProviderID>, UUID> result;
 
   foreach (
       const ResourceVersionUUID& resourceVersionUUID,
@@ -891,11 +919,7 @@ hashmap<Option<ResourceProviderID>, id::UUID> parseResourceVersions(
 
     CHECK(!result.contains(resourceProviderId));
 
-    const Try<id::UUID> uuid =
-      id::UUID::fromBytes(resourceVersionUUID.uuid().value());
-    CHECK_SOME(uuid);
-
-    result.insert({std::move(resourceProviderId), std::move(uuid.get())});
+    result.insert({std::move(resourceProviderId), resourceVersionUUID.uuid()});
   }
 
   return result;
@@ -954,21 +978,40 @@ ContainerID getRootContainerId(const ContainerID& containerId)
 }
 
 
+ContainerID parseContainerId(const string& value)
+{
+  vector<string> tokens = strings::split(value, ".");
+
+  Option<ContainerID> result;
+  foreach (const string& token, tokens) {
+    ContainerID id;
+    id.set_value(token);
+
+    if (result.isSome()) {
+      id.mutable_parent()->CopyFrom(result.get());
+    }
+
+    result = id;
+  }
+
+  CHECK_SOME(result);
+  return result.get();
+}
+
+
 Try<Resources> getConsumedResources(const Offer::Operation& operation)
 {
   switch (operation.type()) {
-    case Offer::Operation::CREATE_VOLUME:
-      return operation.create_volume().source();
-    case Offer::Operation::DESTROY_VOLUME:
-      return operation.destroy_volume().volume();
-    case Offer::Operation::CREATE_BLOCK:
-      return operation.create_block().source();
-    case Offer::Operation::DESTROY_BLOCK:
-      return operation.destroy_block().block();
+    case Offer::Operation::CREATE_DISK:
+      return operation.create_disk().source();
+    case Offer::Operation::DESTROY_DISK:
+      return operation.destroy_disk().source();
     case Offer::Operation::RESERVE:
     case Offer::Operation::UNRESERVE:
     case Offer::Operation::CREATE:
-    case Offer::Operation::DESTROY: {
+    case Offer::Operation::DESTROY:
+    case Offer::Operation::GROW_VOLUME:
+    case Offer::Operation::SHRINK_VOLUME: {
       Try<vector<ResourceConversion>> conversions =
         getResourceConversions(operation);
 
@@ -1005,7 +1048,8 @@ bool operator==(const Capabilities& left, const Capabilities& right)
   return left.multiRole == right.multiRole &&
          left.hierarchicalRole == right.hierarchicalRole &&
          left.reservationRefinement == right.reservationRefinement &&
-         left.resourceProvider == right.resourceProvider;
+         left.resourceProvider == right.resourceProvider &&
+         left.resizeVolume == right.resizeVolume;
 }
 
 
@@ -1073,7 +1117,7 @@ Unavailability createUnavailability(
   unavailability.mutable_start()->set_nanoseconds(start.duration().ns());
 
   if (duration.isSome()) {
-    unavailability.mutable_duration()->set_nanoseconds(duration.get().ns());
+    unavailability.mutable_duration()->set_nanoseconds(duration->ns());
   }
 
   return unavailability;
@@ -1226,7 +1270,7 @@ mesos::master::Event createFrameworkRemoved(const FrameworkInfo& frameworkInfo)
 
 mesos::master::Response::GetAgents::Agent createAgentResponse(
     const mesos::internal::master::Slave& slave,
-    const Option<Owned<AuthorizationAcceptor>>& rolesAcceptor)
+    const Option<Owned<ObjectApprovers>>& approvers)
 {
   mesos::master::Response::GetAgents::Agent agent;
 
@@ -1241,32 +1285,32 @@ mesos::master::Response::GetAgents::Agent createAgentResponse(
 
   if (slave.reregisteredTime.isSome()) {
     agent.mutable_reregistered_time()->set_nanoseconds(
-        slave.reregisteredTime.get().duration().ns());
+        slave.reregisteredTime->duration().ns());
   }
 
   agent.mutable_agent_info()->clear_resources();
   foreach (const Resource& resource, slave.info.resources()) {
-    if (authorizeResource(resource, rolesAcceptor)) {
+    if (approvers.isNone() || approvers.get()->approved<VIEW_ROLE>(resource)) {
       agent.mutable_agent_info()->add_resources()->CopyFrom(resource);
     }
   }
 
   foreach (Resource resource, slave.totalResources) {
-    if (authorizeResource(resource, rolesAcceptor)) {
+    if (approvers.isNone() || approvers.get()->approved<VIEW_ROLE>(resource)) {
       convertResourceFormat(&resource, ENDPOINT);
       agent.add_total_resources()->CopyFrom(resource);
     }
   }
 
   foreach (Resource resource, Resources::sum(slave.usedResources)) {
-    if (authorizeResource(resource, rolesAcceptor)) {
+    if (approvers.isNone() || approvers.get()->approved<VIEW_ROLE>(resource)) {
       convertResourceFormat(&resource, ENDPOINT);
       agent.add_allocated_resources()->CopyFrom(resource);
     }
   }
 
   foreach (Resource resource, slave.offeredResources) {
-    if (authorizeResource(resource, rolesAcceptor)) {
+    if (approvers.isNone() || approvers.get()->approved<VIEW_ROLE>(resource)) {
       convertResourceFormat(&resource, ENDPOINT);
       agent.add_offered_resources()->CopyFrom(resource);
     }
@@ -1276,13 +1320,14 @@ mesos::master::Response::GetAgents::Agent createAgentResponse(
       slave.capabilities.toRepeatedPtrField());
 
   foreachvalue (
-      const ResourceProviderInfo& resourceProviderInfo,
+      const mesos::internal::master::Slave::ResourceProvider& resourceProvider,
       slave.resourceProviders) {
-    mesos::master::Response::GetAgents::Agent::ResourceProvider*
-      resourceProvider = agent.add_resource_providers();
+    mesos::master::Response::GetAgents::Agent::ResourceProvider* provider =
+      agent.add_resource_providers();
 
-    resourceProvider->mutable_resource_provider_info()->CopyFrom(
-        resourceProviderInfo);
+    provider->mutable_resource_provider_info()->CopyFrom(resourceProvider.info);
+    provider->mutable_total_resources()->CopyFrom(
+        resourceProvider.totalResources);
   }
 
   return agent;

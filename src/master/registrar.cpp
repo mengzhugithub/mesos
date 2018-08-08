@@ -30,7 +30,7 @@
 #include <process/owned.hpp>
 #include <process/process.hpp>
 
-#include <process/metrics/gauge.hpp>
+#include <process/metrics/pull_gauge.hpp>
 #include <process/metrics/metrics.hpp>
 #include <process/metrics/timer.hpp>
 
@@ -67,7 +67,7 @@ using process::http::OK;
 
 using process::http::authentication::Principal;
 
-using process::metrics::Gauge;
+using process::metrics::PullGauge;
 using process::metrics::Timer;
 
 using std::deque;
@@ -96,28 +96,20 @@ public:
       flags(_flags),
       authenticationRealm(_authenticationRealm) {}
 
-  virtual ~RegistrarProcess() {}
+  ~RegistrarProcess() override {}
 
   // Registrar implementation.
   Future<Registry> recover(const MasterInfo& info);
   Future<bool> apply(Owned<RegistryOperation> operation);
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
-    if (authenticationRealm.isSome()) {
       route(
           "/registry",
-          authenticationRealm.get(),
+          authenticationRealm,
           registryHelp(),
           &RegistrarProcess::getRegistry);
-    } else {
-      route(
-          "/registry",
-          registryHelp(),
-          lambda::bind(
-              &RegistrarProcess::getRegistry, this, lambda::_1, None()));
-    }
   }
 
 private:
@@ -135,7 +127,7 @@ private:
     explicit Recover(const MasterInfo& _info) : info(_info) {}
 
   protected:
-    virtual Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs)
+    Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs) override
     {
       registry->mutable_master()->mutable_info()->CopyFrom(info);
       return true; // Mutation.
@@ -174,14 +166,14 @@ private:
       process::metrics::remove(state_store);
     }
 
-    Gauge queued_operations;
-    Gauge registry_size_bytes;
+    PullGauge queued_operations;
+    PullGauge registry_size_bytes;
 
     Timer<Milliseconds> state_fetch;
     Timer<Milliseconds> state_store;
   } metrics;
 
-  // Gauge handlers.
+  // PullGauge handlers.
   double _queued_operations()
   {
     return static_cast<double>(operations.size());
@@ -530,7 +522,7 @@ void RegistrarProcess::_update(
   updating = false;
 
   // Abort if the storage operation did not succeed.
-  if (!store.isReady() || store.get().isNone()) {
+  if (!store.isReady() || store->isNone()) {
     string message = "Failed to update registry: ";
 
     if (store.isFailed()) {
@@ -551,7 +543,7 @@ void RegistrarProcess::_update(
 
   LOG(INFO) << "Successfully updated the registry in " << elapsed;
 
-  variable = store.get().get();
+  variable = store->get();
   registry->Swap(updatedRegistry.get());
 
   // Remove the operations.

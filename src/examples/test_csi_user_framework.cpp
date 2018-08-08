@@ -95,7 +95,7 @@ public:
       master(_master),
       state(INITIALIZING) {}
 
-  ~HTTPScheduler() {}
+  ~HTTPScheduler() override {}
 
   void connected()
   {
@@ -198,7 +198,7 @@ public:
   }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // We initialize the library here to ensure that callbacks are only invoked
     // after the process has spawned.
@@ -286,13 +286,13 @@ private:
               cout << "Converting 'RAW' disk to 'MOUNT' disk" << endl;
 
               Offer::Operation* operation = accept->add_operations();
-              operation->set_type(Offer::Operation::CREATE_VOLUME);
+              operation->set_type(Offer::Operation::CREATE_DISK);
 
-              Offer::Operation::CreateVolume* create_volume =
-                operation->mutable_create_volume();
+              Offer::Operation::CreateDisk* createDisk =
+                operation->mutable_create_disk();
 
-              create_volume->mutable_source()->CopyFrom(resource);
-              create_volume->set_target_type(
+              createDisk->mutable_source()->CopyFrom(resource);
+              createDisk->set_target_type(
                   Resource::DiskInfo::Source::MOUNT);
             }
           } else if (type == MOUNT) {

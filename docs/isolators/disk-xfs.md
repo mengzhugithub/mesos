@@ -39,5 +39,25 @@ to display the `fsxattr.projid` field. For example:
 
     $ xfs_io -r -c stat /mnt/mesos/
 
-Note that the Posix Disk isolator `--container_disk_watch_interval`
-does not apply to the XFS Disk isolator.
+Project IDs are not reclaimed until the sandboxes they were assigned to
+are garbage collected. The XFS Disk isolator periodically checks if
+sandboxes of terminated containers still exist and deallocates project
+IDs of the ones that were removed. Such checks are performed at
+intervals specified by the
+[`--disk_watch_interval`](configuration/agent.md#disk_watch_interval)
+flag. Current number of available project IDs and total number of
+project IDs used by the isolator can be tracked using
+`containerizer/mesos/disk/project_ids_free` and
+`containerizer/mesos/disk/project_ids_total` metrics.
+
+## Killing containers
+
+The XFS Disk isolator flag `--xfs_kill_containers` will create container
+quotas that have a gap between the soft and hard limits. The soft limit is
+equal to the limit requested for the `disk` resource and the hard limit
+is 10MB higher. If a container violates the soft limit then it will be
+killed. The isolator polls for soft limit violations at the interval
+specified by the `--container_disk_watch_interval` flag.
+
+Note that the `--container_disk_watch_interval` flag only applies to
+the XFS Disk isolator when `--xfs_kill_containers` is set to true.

@@ -23,6 +23,7 @@
 #include <mesos/resources.hpp>
 
 #include <mesos/state/in_memory.hpp>
+#include <mesos/state/leveldb.hpp>
 #include <mesos/state/state.hpp>
 
 #include <mesos/v1/mesos.hpp>
@@ -33,8 +34,6 @@
 #include <process/gmock.hpp>
 #include <process/gtest.hpp>
 #include <process/http.hpp>
-
-#include <process/ssl/flags.hpp>
 
 #include <stout/duration.hpp>
 #include <stout/error.hpp>
@@ -48,6 +47,7 @@
 #include <stout/try.hpp>
 
 #include "common/http.hpp"
+#include "common/protobuf_utils.hpp"
 #include "common/recordio.hpp"
 
 #include "internal/devolve.hpp"
@@ -58,6 +58,7 @@
 #include "slave/slave.hpp"
 
 #include "tests/mesos.hpp"
+#include "tests/utils.hpp"
 
 namespace http = process::http;
 
@@ -67,20 +68,19 @@ using mesos::master::detector::MasterDetector;
 
 using mesos::state::InMemoryStorage;
 using mesos::state::State;
+using mesos::state::Storage;
 
 using mesos::resource_provider::AdmitResourceProvider;
 using mesos::resource_provider::Registrar;
 using mesos::resource_provider::RemoveResourceProvider;
 
 using mesos::v1::resource_provider::Call;
-using mesos::v1::resource_provider::Driver;
 using mesos::v1::resource_provider::Event;
 
 using process::Clock;
 using process::Future;
 using process::Message;
 using process::Owned;
-using process::PID;
 
 using process::http::Accepted;
 using process::http::BadRequest;
@@ -103,28 +103,7 @@ namespace tests {
 
 class ResourceProviderManagerHttpApiTest
   : public MesosTest,
-    public WithParamInterface<ContentType>
-{
-public:
-  slave::Flags CreateSlaveFlags() override
-  {
-    slave::Flags slaveFlags = MesosTest::CreateSlaveFlags();
-
-    slaveFlags.authenticate_http_readwrite = false;
-
-    // Set the resource provider capability.
-    vector<SlaveInfo::Capability> capabilities = slave::AGENT_CAPABILITIES();
-    SlaveInfo::Capability capability;
-    capability.set_type(SlaveInfo::Capability::RESOURCE_PROVIDER);
-    capabilities.push_back(capability);
-
-    slaveFlags.agent_features = SlaveCapabilities();
-    slaveFlags.agent_features->mutable_capabilities()->CopyFrom(
-        {capabilities.begin(), capabilities.end()});
-
-    return slaveFlags;
-  }
-};
+    public WithParamInterface<ContentType> {};
 
 
 // The tests are parameterized by the content type of the request.
@@ -140,7 +119,8 @@ TEST_F(ResourceProviderManagerHttpApiTest, NoContentType)
   request.method = "POST";
   request.headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
 
-  ResourceProviderManager manager;
+  ResourceProviderManager manager(
+      Registrar::create(Owned<Storage>(new InMemoryStorage)).get());
 
   Future<http::Response> response = manager.api(request, None());
 
@@ -165,7 +145,8 @@ TEST_F(ResourceProviderManagerHttpApiTest, ValidJsonButInvalidProtobuf)
   request.headers["Content-Type"] = APPLICATION_JSON;
   request.body = stringify(object);
 
-  ResourceProviderManager manager;
+  ResourceProviderManager manager(
+      Registrar::create(Owned<Storage>(new InMemoryStorage)).get());
 
   Future<http::Response> response = manager.api(request, None());
 
@@ -188,7 +169,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, MalformedContent)
   request.headers["Content-Type"] = stringify(contentType);
   request.body = "MALFORMED_CONTENT";
 
-  ResourceProviderManager manager;
+  ResourceProviderManager manager(
+      Registrar::create(Owned<Storage>(new InMemoryStorage)).get());
 
   Future<http::Response> response = manager.api(request, None());
 
@@ -234,7 +216,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, UnsupportedContentMediaType)
   request.headers["Content-Type"] = unknownMediaType;
   request.body = serialize(contentType, call);
 
-  ResourceProviderManager manager;
+  ResourceProviderManager manager(
+      Registrar::create(Owned<Storage>(new InMemoryStorage)).get());
 
   Future<http::Response> response = manager.api(request, None());
 
@@ -246,7 +229,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, UpdateState)
 {
   const ContentType contentType = GetParam();
 
-  ResourceProviderManager manager;
+  ResourceProviderManager manager(
+      Registrar::create(Owned<Storage>(new InMemoryStorage)).get());
 
   Option<id::UUID> streamId;
   Option<mesos::v1::ResourceProviderID> resourceProviderId;
@@ -318,8 +302,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, UpdateState)
     Call::UpdateState* updateState = call.mutable_update_state();
 
     updateState->mutable_resources()->CopyFrom(v1::Resources(resources));
-    updateState->mutable_resource_version_uuid()->set_value(
-        id::UUID::random().toBytes());
+    updateState->mutable_resource_version_uuid()->CopyFrom(
+        evolve(protobuf::createUUID()));
 
     http::Request request;
     request.method = "POST";
@@ -353,7 +337,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, UpdateOperationStatus)
 {
   const ContentType contentType = GetParam();
 
-  ResourceProviderManager manager;
+  ResourceProviderManager manager(
+      Registrar::create(Owned<Storage>(new InMemoryStorage)).get());
 
   Option<id::UUID> streamId;
   Option<mesos::v1::ResourceProviderID> resourceProviderId;
@@ -418,8 +403,7 @@ TEST_P(ResourceProviderManagerHttpApiTest, UpdateOperationStatus)
     mesos::v1::OperationStatus status;
     status.set_state(mesos::v1::OperationState::OPERATION_FINISHED);
 
-    mesos::v1::UUID operationUUID;
-    operationUUID.set_value(id::UUID::random().toBytes());
+    mesos::v1::UUID operationUUID = evolve(protobuf::createUUID());;
 
     Call call;
     call.set_type(Call::UPDATE_OPERATION_STATUS);
@@ -449,7 +433,7 @@ TEST_P(ResourceProviderManagerHttpApiTest, UpdateOperationStatus)
 
     AWAIT_READY(message);
 
-    EXPECT_EQ(
+    ASSERT_EQ(
         ResourceProviderMessage::Type::UPDATE_OPERATION_STATUS,
         message->type);
     EXPECT_EQ(
@@ -472,7 +456,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, PublishResourcesSuccess)
 {
   const ContentType contentType = GetParam();
 
-  ResourceProviderManager manager;
+  ResourceProviderManager manager(
+      Registrar::create(Owned<Storage>(new InMemoryStorage)).get());
 
   Option<id::UUID> streamId;
   Option<mesos::v1::ResourceProviderID> resourceProviderId;
@@ -579,7 +564,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, PublishResourcesFailure)
 {
   const ContentType contentType = GetParam();
 
-  ResourceProviderManager manager;
+  ResourceProviderManager manager(
+      Registrar::create(Owned<Storage>(new InMemoryStorage)).get());
 
   Option<id::UUID> streamId;
   Option<mesos::v1::ResourceProviderID> resourceProviderId;
@@ -686,7 +672,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, PublishResourcesDisconnected)
 {
   const ContentType contentType = GetParam();
 
-  ResourceProviderManager manager;
+  ResourceProviderManager manager(
+      Registrar::create(Owned<Storage>(new InMemoryStorage)).get());
 
   Option<mesos::v1::ResourceProviderID> resourceProviderId;
   Option<http::Pipe::Reader> reader;
@@ -767,14 +754,17 @@ TEST_P(ResourceProviderManagerHttpApiTest, AgentEndpoint)
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
-
   Owned<MasterDetector> detector = master.get()->createDetector();
+
+  // For the agent's resource provider manager to start,
+  // the agent needs to have been assigned an agent ID.
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
 
   Try<Owned<cluster::Slave>> agent = StartSlave(detector.get());
   ASSERT_SOME(agent);
 
-  AWAIT_READY(__recover);
+  AWAIT_READY(slaveRegisteredMessage);
 
   // Wait for recovery to be complete.
   Clock::pause();
@@ -828,84 +818,177 @@ TEST_P(ResourceProviderManagerHttpApiTest, AgentEndpoint)
 class ResourceProviderRegistrarTest : public tests::MesosTest {};
 
 
-// Test that the agent resource provider registrar works as expected.
-TEST_F(ResourceProviderRegistrarTest, AgentRegistrar)
+// Test that the generic resource provider registrar works as expected.
+//
+// TODO(bbannier): Enable this test on Windows once MESOS-5932 is resolved.
+#ifndef __WINDOWS__
+TEST_F_TEMP_DISABLED_ON_WINDOWS(ResourceProviderRegistrarTest, GenericRegistrar)
 {
-  ResourceProviderID resourceProviderId;
-  resourceProviderId.set_value("foo");
+  mesos::resource_provider::registry::ResourceProvider resourceProvider;
+  resourceProvider.mutable_id()->set_value("foo");
+  resourceProvider.set_name("bar");
+  resourceProvider.set_type("org.apache.mesos.rp.test");
 
-  Try<Owned<cluster::Master>> master = StartMaster();
-  ASSERT_SOME(master);
+  // Perform operations on the resource provider. We use
+  // persistent storage so we can recover the state below.
+  {
+    Owned<mesos::state::Storage> storage(
+        new mesos::state::LevelDBStorage(sandbox.get()));
+    Try<Owned<Registrar>> registrar = Registrar::create(std::move(storage));
 
-  Owned<MasterDetector> detector = master.get()->createDetector();
+    ASSERT_SOME_NE(Owned<Registrar>(nullptr), registrar);
 
-  const slave::Flags flags = CreateSlaveFlags();
+    Future<mesos::resource_provider::registry::Registry> recover =
+      registrar.get()->recover();
+    AWAIT_READY(recover);
+    EXPECT_TRUE(recover->removed_resource_providers().empty());
 
-  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
-    FUTURE_PROTOBUF(SlaveRegisteredMessage(), master.get()->pid, _);
+    Future<bool> admitResourceProvider =
+      registrar.get()->apply(Owned<Registrar::Operation>(
+          new AdmitResourceProvider(resourceProvider)));
+    AWAIT_READY(admitResourceProvider);
+    EXPECT_TRUE(admitResourceProvider.get());
 
-  Future<UpdateSlaveMessage> updateSlaveMessage =
-    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+    // A resource provider cannot resubscribe with changed type or name.
+    mesos::resource_provider::registry::ResourceProvider resourceProvider_ =
+      resourceProvider;
+    resourceProvider_.set_type("org.apache.mesos.rp.test2");
 
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
-  ASSERT_SOME(slave);
+    admitResourceProvider =
+      registrar.get()->apply(Owned<Registrar::Operation>(
+          new AdmitResourceProvider(resourceProvider_)));
+    AWAIT_READY(admitResourceProvider);
+    EXPECT_FALSE(admitResourceProvider.get());
 
-  AWAIT_READY(slaveRegisteredMessage);
+    Future<bool> removeResourceProvider =
+      registrar.get()->apply(Owned<Registrar::Operation>(
+          new RemoveResourceProvider(resourceProvider.id())));
+    AWAIT_READY(removeResourceProvider);
+    EXPECT_TRUE(removeResourceProvider.get());
 
-  // The agent will send `UpdateSlaveMessage` after it has created its
-  // meta directories. Await the message to make sure the agent
-  // registrar can create its store in the meta hierarchy.
-  AWAIT_READY(updateSlaveMessage);
+    // A removed resource provider cannot be admitted again.
+    admitResourceProvider =
+      registrar.get()->apply(Owned<Registrar::Operation>(
+          new AdmitResourceProvider(resourceProvider)));
+    AWAIT_READY(admitResourceProvider);
+    EXPECT_FALSE(admitResourceProvider.get());
+  }
 
-  Try<Owned<Registrar>> registrar =
-    Registrar::create(flags, slaveRegisteredMessage->slave_id());
+  // Recover and validate the previous registry state.
+  {
+    Owned<mesos::state::Storage> storage(
+        new mesos::state::LevelDBStorage(sandbox.get()));
+    Try<Owned<Registrar>> registrar = Registrar::create(std::move(storage));
 
-  ASSERT_SOME(registrar);
-  ASSERT_NE(nullptr, registrar->get());
+    ASSERT_SOME_NE(Owned<Registrar>(nullptr), registrar);
 
-  // Applying operations on a not yet recovered registrar fails.
-  AWAIT_FAILED(registrar.get()->apply(Owned<Registrar::Operation>(
-      new AdmitResourceProvider(resourceProviderId))));
+    Future<mesos::resource_provider::registry::Registry> recover =
+      registrar.get()->recover();
+    AWAIT_READY(recover);
 
-  AWAIT_READY(registrar.get()->recover());
+    EXPECT_TRUE(recover->resource_providers().empty());
+    ASSERT_EQ(1, recover->removed_resource_providers_size());
 
-  AWAIT_READY(registrar.get()->apply(Owned<Registrar::Operation>(
-      new AdmitResourceProvider(resourceProviderId))));
+    const mesos::resource_provider::registry::ResourceProvider&
+      resourceProvider_ = recover->removed_resource_providers(0);
 
-  AWAIT_READY(registrar.get()->apply(Owned<Registrar::Operation>(
-      new RemoveResourceProvider(resourceProviderId))));
+    EXPECT_EQ(resourceProvider, resourceProvider_);
+  }
 }
+#endif // __WINDOWS__
 
 
 // Test that the master resource provider registrar works as expected.
-TEST_F(ResourceProviderRegistrarTest, MasterRegistrar)
+//
+// TODO(bbannier): Enable this test on Windows once MESOS-5932 is resolved.
+#ifndef __WINDOWS__
+TEST_F_TEMP_DISABLED_ON_WINDOWS(ResourceProviderRegistrarTest, MasterRegistrar)
 {
-  ResourceProviderID resourceProviderId;
-  resourceProviderId.set_value("foo");
+  mesos::resource_provider::registry::ResourceProvider resourceProvider;
+  resourceProvider.mutable_id()->set_value("foo");
+  resourceProvider.set_name("bar");
+  resourceProvider.set_type("org.apache.mesos.rp.test");
 
-  InMemoryStorage storage;
-  State state(&storage);
-  master::Registrar masterRegistrar(CreateMasterFlags(), &state);
+  // Perform operations on the resource provider. We use
+  // persistent storage so we can recover the state below.
+  {
+    mesos::state::LevelDBStorage storage(sandbox.get());
+    State state(&storage);
+    master::Registrar masterRegistrar(CreateMasterFlags(), &state);
 
-  const MasterInfo masterInfo = protobuf::createMasterInfo({});
+    const MasterInfo masterInfo = protobuf::createMasterInfo({});
 
-  Try<Owned<Registrar>> registrar = Registrar::create(&masterRegistrar);
+    Future<Registry> registry = masterRegistrar.recover(masterInfo);
+    AWAIT_READY(registry);
 
-  ASSERT_SOME(registrar);
-  ASSERT_NE(nullptr, registrar->get());
+    Try<Owned<Registrar>> registrar = Registrar::create(
+        &masterRegistrar,
+        registry->resource_provider_registry());
 
-  // Applying operations on a not yet recovered registrar fails.
-  AWAIT_FAILED(registrar.get()->apply(Owned<Registrar::Operation>(
-      new AdmitResourceProvider(resourceProviderId))));
+    ASSERT_SOME_NE(Owned<Registrar>(nullptr), registrar);
 
-  AWAIT_READY(masterRegistrar.recover(masterInfo));
+    Future<bool> admitResourceProvider =
+      registrar.get()->apply(Owned<Registrar::Operation>(
+            new AdmitResourceProvider(resourceProvider)));
+    AWAIT_READY(admitResourceProvider);
+    EXPECT_TRUE(admitResourceProvider.get());
 
-  AWAIT_READY(registrar.get()->apply(Owned<Registrar::Operation>(
-      new AdmitResourceProvider(resourceProviderId))));
+    // A resource provider cannot resubscribe with changed type or name.
+    mesos::resource_provider::registry::ResourceProvider resourceProvider_ =
+      resourceProvider;
+    resourceProvider_.set_type("org.apache.mesos.rp.test2");
 
-  AWAIT_READY(registrar.get()->apply(Owned<Registrar::Operation>(
-      new RemoveResourceProvider(resourceProviderId))));
+    admitResourceProvider =
+      registrar.get()->apply(Owned<Registrar::Operation>(
+          new AdmitResourceProvider(resourceProvider_)));
+    AWAIT_READY(admitResourceProvider);
+    EXPECT_FALSE(admitResourceProvider.get());
+
+    Future<bool> removeResourceProvider =
+      registrar.get()->apply(Owned<Registrar::Operation>(
+            new RemoveResourceProvider(resourceProvider.id())));
+    AWAIT_READY(removeResourceProvider);
+    EXPECT_TRUE(removeResourceProvider.get());
+
+    // A removed resource provider cannot be admitted again.
+    admitResourceProvider =
+      registrar.get()->apply(Owned<Registrar::Operation>(
+            new AdmitResourceProvider(resourceProvider)));
+    AWAIT_READY(admitResourceProvider);
+    EXPECT_FALSE(admitResourceProvider.get());
+  }
+
+  // Recover and validate the previous registry state.
+  {
+    mesos::state::LevelDBStorage storage(sandbox.get());
+    State state(&storage);
+    master::Registrar masterRegistrar(CreateMasterFlags(), &state);
+
+    const MasterInfo masterInfo = protobuf::createMasterInfo({});
+
+    Future<Registry> registry = masterRegistrar.recover(masterInfo);
+    AWAIT_READY(registry);
+
+    Try<Owned<Registrar>> registrar = Registrar::create(
+        &masterRegistrar,
+        registry->resource_provider_registry());
+
+    ASSERT_SOME_NE(Owned<Registrar>(nullptr), registrar);
+
+    Future<mesos::resource_provider::registry::Registry> recover =
+      registrar.get()->recover();
+    AWAIT_READY(recover);
+
+    EXPECT_TRUE(recover->resource_providers().empty());
+    ASSERT_EQ(1, recover->removed_resource_providers_size());
+
+    const mesos::resource_provider::registry::ResourceProvider&
+      resourceProvider_ = recover->removed_resource_providers(0);
+
+    EXPECT_EQ(resourceProvider, resourceProvider_);
+  }
 }
+#endif // __WINDOWS__
 
 
 // Test that resource provider resources are offered to frameworks,
@@ -915,8 +998,7 @@ TEST_F(ResourceProviderRegistrarTest, MasterRegistrar)
 TEST_P(ResourceProviderManagerHttpApiTest, ConvertResources)
 {
   // Start master and agent.
-  master::Flags masterFlags = CreateMasterFlags();
-  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
@@ -956,25 +1038,12 @@ TEST_P(ResourceProviderManagerHttpApiTest, ConvertResources)
       resourceProviderInfo, Some(v1::Resources(disk)));
 
   // Start and register a resource provider.
-  string scheme = "http";
-
-#ifdef USE_SSL_SOCKET
-  if (process::network::openssl::flags().enabled) {
-    scheme = "https";
-  }
-#endif
-
-  http::URL url(
-      scheme,
-      agent.get()->pid.address.ip,
-      agent.get()->pid.address.port,
-      agent.get()->pid.id + "/api/v1/resource_provider");
-
-  Owned<EndpointDetector> endpointDetector(new ConstantEndpointDetector(url));
+  Owned<EndpointDetector> endpointDetector(
+      resource_provider::createEndpointDetector(agent.get()->pid));
 
   const ContentType contentType = GetParam();
 
-  resourceProvider.start(endpointDetector, contentType, v1::DEFAULT_CREDENTIAL);
+  resourceProvider.start(endpointDetector, contentType);
 
   // Wait until the agent's resources have been updated to include the
   // resource provider resources.
@@ -1035,7 +1104,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, ConvertResources)
       v1::createCallAccept(
           frameworkId,
           offer1,
-          {v1::RESERVE(reserved), v1::CREATE_BLOCK(reserved)}));
+          {v1::RESERVE(reserved),
+           v1::CREATE_DISK(reserved, v1::Resource::DiskInfo::Source::MOUNT)}));
 
   // The converted resource should be offered to the framework.
   AWAIT_READY(offers2);
@@ -1043,29 +1113,35 @@ TEST_P(ResourceProviderManagerHttpApiTest, ConvertResources)
 
   const v1::Offer& offer2 = offers2->offers(0);
 
-  Option<v1::Resource> block;
+  Option<v1::Resource> mountDisk;
   foreach (const v1::Resource& resource, offer2.resources()) {
     if (resource.has_provider_id()) {
-      block = resource;
+      mountDisk = resource;
     }
   }
 
-  ASSERT_SOME(block);
+  ASSERT_SOME(mountDisk);
   EXPECT_EQ(
-      v1::Resource::DiskInfo::Source::BLOCK, block->disk().source().type());
-  EXPECT_FALSE(block->reservations().empty());
+      v1::Resource::DiskInfo::Source::MOUNT, mountDisk->disk().source().type());
+  EXPECT_FALSE(mountDisk->reservations().empty());
 }
 
 
 // Test that resource provider can resubscribe with an agent after
 // a resource provider failover as well as an agent failover.
-TEST_P(ResourceProviderManagerHttpApiTest, ResubscribeResourceProvider)
+//
+// TODO(bbannier): This test is currently disabled on Windows as the resource
+// provider manager uses a LevelDB store which is at the moment not supported on
+// Windows (see MESOS-5932) and we use an in-memory store. The in-memory store
+// does not survive agent restarts so that resubscription attempts are rejected
+// (resource provider is unknown).
+TEST_P_TEMP_DISABLED_ON_WINDOWS(
+    ResourceProviderManagerHttpApiTest, ResubscribeResourceProvider)
 {
   Clock::pause();
 
   // Start master and agent.
-  master::Flags masterFlags = CreateMasterFlags();
-  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
@@ -1095,28 +1171,12 @@ TEST_P(ResourceProviderManagerHttpApiTest, ResubscribeResourceProvider)
       new v1::MockResourceProvider(resourceProviderInfo, v1::Resources(disk)));
 
   // Start and register a resource provider.
-  string scheme = "http";
-
-#ifdef USE_SSL_SOCKET
-  if (process::network::openssl::flags().enabled) {
-    scheme = "https";
-  }
-#endif
-
-  http::URL url(
-      scheme,
-      agent.get()->pid.address.ip,
-      agent.get()->pid.address.port,
-      agent.get()->pid.id + "/api/v1/resource_provider");
-
-  Owned<EndpointDetector> endpointDetector(new ConstantEndpointDetector(url));
+  Owned<EndpointDetector> endpointDetector(
+      resource_provider::createEndpointDetector(agent.get()->pid));
 
   const ContentType contentType = GetParam();
 
-  resourceProvider->start(
-      endpointDetector,
-      contentType,
-      v1::DEFAULT_CREDENTIAL);
+  resourceProvider->start(endpointDetector, contentType);
 
   // Wait until the agent's resources have been updated to include the
   // resource provider resources. At this point the resource provider
@@ -1136,18 +1196,28 @@ TEST_P(ResourceProviderManagerHttpApiTest, ResubscribeResourceProvider)
   EXPECT_CALL(*resourceProvider, subscribed(_))
     .WillOnce(FutureArg<0>(&subscribed1));
 
-  resourceProvider->start(
-      endpointDetector,
-      contentType,
-      v1::DEFAULT_CREDENTIAL);
+  resourceProvider->start(endpointDetector, contentType);
 
   AWAIT_READY(subscribed1);
   EXPECT_EQ(resourceProviderInfo.id(), subscribed1->provider_id());
 
   Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
 
+  // We terminate the resource provider once we have confirmed that it
+  // got disconnected. This avoids it to in turn resubscribe racing
+  // with the newly created resource provider.
+  Future<Nothing> disconnected;
+  EXPECT_CALL(*resourceProvider, disconnected())
+    .WillOnce(DoAll(
+        Invoke([&resourceProvider]() { resourceProvider.reset(); }),
+        FutureSatisfy(&disconnected)))
+    .WillRepeatedly(Return()); // Ignore spurious calls concurrent with `reset`.
+
   // The agent failover.
   agent->reset();
+
+  AWAIT_READY(disconnected);
+
   agent = StartSlave(detector.get(), slaveFlags);
 
   Clock::advance(slaveFlags.registration_backoff_factor);
@@ -1155,13 +1225,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, ResubscribeResourceProvider)
 
   AWAIT_READY(__recover);
 
-  url = http::URL(
-      scheme,
-      agent.get()->pid.address.ip,
-      agent.get()->pid.address.port,
-      agent.get()->pid.id + "/api/v1/resource_provider");
-
-  endpointDetector.reset(new ConstantEndpointDetector(url));
+  endpointDetector =
+    resource_provider::createEndpointDetector(agent.get()->pid);
 
   resourceProvider.reset(new v1::MockResourceProvider(
       resourceProviderInfo,
@@ -1171,13 +1236,68 @@ TEST_P(ResourceProviderManagerHttpApiTest, ResubscribeResourceProvider)
   EXPECT_CALL(*resourceProvider, subscribed(_))
     .WillOnce(FutureArg<0>(&subscribed2));
 
-  resourceProvider->start(
-      endpointDetector,
-      contentType,
-      v1::DEFAULT_CREDENTIAL);
+  resourceProvider->start(endpointDetector, contentType);
 
   AWAIT_READY(subscribed2);
   EXPECT_EQ(resourceProviderInfo.id(), subscribed2->provider_id());
+}
+
+
+// Test that when a resource provider attempts to resubscribe with an
+// unknown ID it is not admitted but disconnected.
+TEST_P(ResourceProviderManagerHttpApiTest, ResubscribeUnknownID)
+{
+  Clock::pause();
+
+  // Start master and agent.
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  // For the agent's resource provider manager to start,
+  // the agent needs to have been assigned an agent ID.
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(agent);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  mesos::v1::ResourceProviderID resourceProviderId;
+  resourceProviderId.set_value(id::UUID::random().toString());
+
+  mesos::v1::ResourceProviderInfo resourceProviderInfo;
+  resourceProviderInfo.mutable_id()->CopyFrom(resourceProviderId);
+  resourceProviderInfo.set_type("org.apache.mesos.rp.test");
+  resourceProviderInfo.set_name("test");
+
+  Owned<v1::MockResourceProvider> resourceProvider(
+      new v1::MockResourceProvider(resourceProviderInfo));
+
+  // We explicitly reset the resource provider after the expected
+  // disconnect to prevent it from resubscribing indefinitely.
+  Future<Nothing> disconnected;
+  EXPECT_CALL(*resourceProvider, disconnected())
+    .WillOnce(DoAll(
+        Invoke([&resourceProvider]() { resourceProvider.reset(); }),
+        FutureSatisfy(&disconnected)));
+
+  // Start and register a resource provider.
+  Owned<EndpointDetector> endpointDetector(
+      resource_provider::createEndpointDetector(agent.get()->pid));
+
+  const ContentType contentType = GetParam();
+
+  resourceProvider->start(endpointDetector, contentType);
+
+  AWAIT_READY(disconnected);
 }
 
 
@@ -1223,28 +1343,12 @@ TEST_P(ResourceProviderManagerHttpApiTest, ResourceProviderDisconnect)
           v1::Resources(disk)));
 
   // Start and register a resource provider.
-  string scheme = "http";
-
-#ifdef USE_SSL_SOCKET
-  if (process::network::openssl::flags().enabled) {
-    scheme = "https";
-  }
-#endif
-
-  http::URL url(
-      scheme,
-      agent.get()->pid.address.ip,
-      agent.get()->pid.address.port,
-      agent.get()->pid.id + "/api/v1/resource_provider");
-
-  Owned<EndpointDetector> endpointDetector(new ConstantEndpointDetector(url));
+  Owned<EndpointDetector> endpointDetector(
+      resource_provider::createEndpointDetector(agent.get()->pid));
 
   const ContentType contentType = GetParam();
 
-  resourceProvider->start(
-      endpointDetector,
-      contentType,
-      v1::DEFAULT_CREDENTIAL);
+  resourceProvider->start(endpointDetector, contentType);
 
   {
     // Wait until the agent's resources have been updated to include
@@ -1288,8 +1392,7 @@ TEST_F(ResourceProviderManagerHttpApiTest, ResourceProviderSubscribeDisconnect)
   Clock::pause();
 
   // Start master and agent.
-  master::Flags masterFlags = CreateMasterFlags();
-  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
@@ -1314,30 +1417,14 @@ TEST_F(ResourceProviderManagerHttpApiTest, ResourceProviderSubscribeDisconnect)
       new v1::MockResourceProvider(resourceProviderInfo));
 
   // Start and register a resource provider.
-  string scheme = "http";
-
-#ifdef USE_SSL_SOCKET
-  if (process::network::openssl::flags().enabled) {
-    scheme = "https";
-  }
-#endif
-
-  http::URL url(
-      scheme,
-      agent.get()->pid.address.ip,
-      agent.get()->pid.address.port,
-      agent.get()->pid.id + "/api/v1/resource_provider");
-
-  Owned<EndpointDetector> endpointDetector(new ConstantEndpointDetector(url));
+  Owned<EndpointDetector> endpointDetector(
+      resource_provider::createEndpointDetector(agent.get()->pid));
 
   Future<Event::Subscribed> subscribed1;
   EXPECT_CALL(*resourceProvider1, subscribed(_))
     .WillOnce(FutureArg<0>(&subscribed1));
 
-  resourceProvider1->start(
-      endpointDetector,
-      ContentType::PROTOBUF,
-      v1::DEFAULT_CREDENTIAL);
+  resourceProvider1->start(endpointDetector, ContentType::PROTOBUF);
 
   AWAIT_READY(subscribed1);
 
@@ -1355,21 +1442,66 @@ TEST_F(ResourceProviderManagerHttpApiTest, ResourceProviderSubscribeDisconnect)
   Future<Nothing> disconnected1;
   EXPECT_CALL(*resourceProvider1, disconnected())
     .WillOnce(DoAll(
-        FutureSatisfy(&disconnected1),
-        Invoke([&resourceProvider1]() { resourceProvider1.reset(); })))
+        Invoke([&resourceProvider1]() { resourceProvider1.reset(); }),
+        FutureSatisfy(&disconnected1)))
     .WillRepeatedly(Return()); // Ignore spurious calls concurrent with `reset`.
 
   Future<Event::Subscribed> subscribed2;
   EXPECT_CALL(*resourceProvider2, subscribed(_))
     .WillOnce(FutureArg<0>(&subscribed2));
 
-  resourceProvider2->start(
-      endpointDetector,
-      ContentType::PROTOBUF,
-      v1::DEFAULT_CREDENTIAL);
+  resourceProvider2->start(endpointDetector, ContentType::PROTOBUF);
 
   AWAIT_READY(disconnected1);
   AWAIT_READY(subscribed2);
+}
+
+
+TEST_F(ResourceProviderManagerHttpApiTest, Metrics)
+{
+  Clock::pause();
+
+  // Start master and agent.
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(agent);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+
+  AWAIT_READY(updateSlaveMessage);
+
+  mesos::v1::ResourceProviderInfo resourceProviderInfo;
+  resourceProviderInfo.set_type("org.apache.mesos.rp.test");
+  resourceProviderInfo.set_name("test");
+
+  Owned<v1::MockResourceProvider> resourceProvider(
+      new v1::MockResourceProvider(resourceProviderInfo));
+
+  // Start and register a resource provider.
+  Owned<EndpointDetector> endpointDetector(
+      resource_provider::createEndpointDetector(agent.get()->pid));
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*resourceProvider, subscribed(_))
+    .WillOnce(FutureArg<0>(&subscribed));
+
+  resourceProvider->start(endpointDetector, ContentType::PROTOBUF);
+
+  AWAIT_READY(subscribed);
+
+  const JSON::Object snapshot = Metrics();
+
+  EXPECT_EQ(1, snapshot.values.at("resource_provider_manager/subscribed"));
 }
 
 } // namespace tests {

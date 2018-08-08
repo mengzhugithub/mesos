@@ -19,15 +19,17 @@
 #include <google/protobuf/util/json_util.h>
 
 #include <stout/bytes.hpp>
+#include <stout/check.hpp>
 #include <stout/foreach.hpp>
+#include <stout/unreachable.hpp>
 
 using std::string;
 
 using mesos::resource_provider::DiskProfileMapping;
 
-namespace mesos{
+namespace mesos {
 namespace internal {
-namespace profile {
+namespace storage {
 
 Try<DiskProfileMapping> parseDiskProfileMapping(
     const string& data)
@@ -42,43 +44,133 @@ Try<DiskProfileMapping> parseDiskProfileMapping(
 
   if (!status.ok()) {
     return Error(
-        "Failed to parse DiskProfileMapping message: "
-        + status.ToString());
+        "Failed to parse DiskProfileMapping message: " +
+        status.ToString());
   }
 
   Option<Error> validation = validate(output);
   if (validation.isSome()) {
     return Error(
-      "Fetched profile mapping failed validation with: " + validation->message);
+        "Fetched profile mapping failed validation with: " +
+        validation->message);
   }
 
   return output;
 }
 
 
+bool isSelectedResourceProvider(
+    const DiskProfileMapping::CSIManifest& profileManifest,
+    const ResourceProviderInfo& resourceProviderInfo)
+{
+  switch (profileManifest.selector_case()) {
+    case DiskProfileMapping::CSIManifest::kResourceProviderSelector: {
+      CHECK(profileManifest.has_resource_provider_selector());
+
+      const auto& selector = profileManifest.resource_provider_selector();
+
+      foreach (const auto& resourceProvider, selector.resource_providers()) {
+        if (resourceProviderInfo.type() == resourceProvider.type() &&
+            resourceProviderInfo.name() == resourceProvider.name()) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+    case DiskProfileMapping::CSIManifest::kCsiPluginTypeSelector: {
+      CHECK(profileManifest.has_csi_plugin_type_selector());
+
+      const auto& selector = profileManifest.csi_plugin_type_selector();
+
+      return resourceProviderInfo.has_storage() &&
+        resourceProviderInfo.storage().plugin().type() ==
+          selector.plugin_type();
+    }
+    case DiskProfileMapping::CSIManifest::SELECTOR_NOT_SET: {
+      UNREACHABLE();
+    }
+  }
+
+  UNREACHABLE();
+}
+
+
+static Option<Error> validateSelector(
+    const DiskProfileMapping::CSIManifest& profileManifest)
+{
+  switch (profileManifest.selector_case()) {
+    case DiskProfileMapping::CSIManifest::kResourceProviderSelector: {
+      if (!profileManifest.has_resource_provider_selector()) {
+        return Error("Expecting 'resource_provider_selector' to be present");
+      }
+
+      const auto& selector = profileManifest.resource_provider_selector();
+
+      foreach (const auto& resourceProvider, selector.resource_providers()) {
+        if (resourceProvider.type().empty()) {
+          return Error(
+              "'type' is a required field for ResourceProviderSelector");
+        }
+
+        if (resourceProvider.name().empty()) {
+          return Error(
+              "'name' is a required field for ResourceProviderSelector");
+        }
+      }
+
+      break;
+    }
+    case DiskProfileMapping::CSIManifest::kCsiPluginTypeSelector: {
+      if (!profileManifest.has_csi_plugin_type_selector()) {
+        return Error("Expecting 'csi_plugin_type_selector' to be present");
+      }
+
+      const auto& selector = profileManifest.csi_plugin_type_selector();
+
+      if (selector.plugin_type().empty()) {
+        return Error(
+            "'plugin_type' is a required field for CSIPluginTypeSelector");
+      }
+
+      break;
+    }
+    case DiskProfileMapping::CSIManifest::SELECTOR_NOT_SET: {
+      return Error("Expecting a selector to be present");
+    }
+  }
+
+  return None();
+}
+
+
 Option<Error> validate(const DiskProfileMapping& mapping)
 {
-  auto iterator = mapping.profile_matrix().begin();
-  while (iterator != mapping.profile_matrix().end()) {
-    if (!iterator->second.has_volume_capabilities()) {
+  foreach (const auto& entry, mapping.profile_matrix()) {
+    Option<Error> selector = validateSelector(entry.second);
+
+    if (selector.isSome()) {
       return Error(
-          "Profile '" + iterator->first + "' is missing the required field "
-          + "'volume_capabilities");
+          "Profile '" + entry.first + "' has no valid selector: " +
+          selector->message);
     }
 
-    Option<Error> capabilities =
-      validate(iterator->second.volume_capabilities());
+    if (!entry.second.has_volume_capabilities()) {
+      return Error(
+          "Profile '" + entry.first +
+          "' is missing the required field 'volume_capabilities'");
+    }
+
+    Option<Error> capabilities = validate(entry.second.volume_capabilities());
 
     if (capabilities.isSome()) {
       return Error(
-          "Profile '" + iterator->first + "' VolumeCapabilities are invalid: "
-          + capabilities->message);
+          "Profile '" + entry.first + "' has an invalid VolumeCapability: " +
+          capabilities->message);
     }
 
     // NOTE: The `create_parameters` field is optional and needs no further
     // validation after parsing.
-
-    iterator++;
   }
 
   return None();
@@ -86,7 +178,7 @@ Option<Error> validate(const DiskProfileMapping& mapping)
 
 
 // TODO(chhsiao): Move this to CSI validation implementation file.
-Option<Error> validate(const csi::VolumeCapability& capability)
+Option<Error> validate(const csi::v0::VolumeCapability& capability)
 {
   if (capability.has_mount()) {
     // The total size of this repeated field may not exceed 4 KB.
@@ -109,13 +201,13 @@ Option<Error> validate(const csi::VolumeCapability& capability)
   }
 
   if (capability.access_mode().mode() ==
-      csi::VolumeCapability::AccessMode::UNKNOWN) {
+      csi::v0::VolumeCapability::AccessMode::UNKNOWN) {
     return Error("'access_mode.mode' is unknown or not set");
   }
 
   return None();
 }
 
-} // namespace profile {
+} // namespace storage {
 } // namespace internal {
 } // namespace mesos {

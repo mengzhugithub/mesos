@@ -726,16 +726,13 @@ Try<Resources> Resources::parse(
 
   Resources result;
 
-  // Validate the Resource objects and convert them
-  // to the "post-reservation-refinement" format.
+  // Validate the Resource objects.
   foreach (Resource resource, resources.get()) {
     // If invalid, propgate error instead of skipping the resource.
     Option<Error> error = Resources::validate(resource);
     if (error.isSome()) {
       return error.get();
     }
-
-    upgradeResource(&resource);
 
     result.add(resource);
   }
@@ -775,6 +772,8 @@ Try<vector<Resource>> Resources::fromJSON(
     if (!resource.has_role() && resource.reservations_size() == 0) {
       resource.set_role(defaultRole);
     }
+
+    upgradeResource(&resource);
 
     // We add the Resource object even if it is empty or invalid.
     result.push_back(resource);
@@ -824,6 +823,8 @@ Try<vector<Resource>> Resources::fromSimpleString(
       return Error(resource.error());
     }
 
+    upgradeResource(&(resource.get()));
+
     // We add the Resource object even if it is empty or invalid.
     resources.push_back(resource.get());
   }
@@ -862,8 +863,11 @@ Option<Error> Resources::validate(const Resource& resource)
       return Error("Invalid scalar resource");
     }
 
-    if (resource.scalar().value() < 0) {
-      return Error("Invalid scalar resource: value < 0");
+    // We do not allow negative scalar resource values or
+    // non-zero values which would be represented as zero.
+    if (resource.scalar().value() != 0 &&
+        resource.scalar() <= Value::Scalar()) {
+      return Error("Invalid scalar resource: value <= 0");
     }
   } else if (resource.type() == Value::RANGES) {
     if (resource.has_scalar() ||
@@ -929,8 +933,20 @@ Option<Error> Resources::validate(const Resource& resource)
           break;
         case Resource::DiskInfo::Source::BLOCK:
         case Resource::DiskInfo::Source::RAW:
-          // TODO(bbannier): Update with validation once the exact format of
-          // `BLOCK` and `RAW` messages have taken some form.
+          if (source.has_mount()) {
+            return Error(
+                "Mount should not be set for " +
+                Resource::DiskInfo::Source::Type_Name(source.type()) +
+                " disk source");
+          }
+
+          if (source.has_path()) {
+            return Error(
+                "Path should not be set for " +
+                Resource::DiskInfo::Source::Type_Name(source.type()) +
+                " disk source");
+          }
+
           break;
         case Resource::DiskInfo::Source::UNKNOWN:
           return Error(
@@ -1232,6 +1248,17 @@ bool Resources::isShared(const Resource& resource)
 }
 
 
+bool Resources::isScalarQuantity(const Resources& resources)
+{
+  // Instead of checking the absence of non-scalar-quantity fields,
+  // we do an equality check between the original resources object and
+  // its stripped counterpart.
+  //
+  // We remove the static reservation metadata here via `toUnreserved()`.
+  return resources == resources.createStrippedScalarQuantity().toUnreserved();
+}
+
+
 bool Resources::hasRefinedReservations(const Resource& resource)
 {
   CHECK(!resource.has_role()) << resource;
@@ -1390,6 +1417,13 @@ Resources::Resources(const Resource& resource)
 }
 
 
+Resources::Resources(Resource&& resource)
+{
+  // NOTE: Invalid and zero Resource object will be ignored.
+  *this += std::move(resource);
+}
+
+
 Resources::Resources(const vector<Resource>& _resources)
 {
   resources.reserve(_resources.size());
@@ -1400,12 +1434,32 @@ Resources::Resources(const vector<Resource>& _resources)
 }
 
 
+Resources::Resources(vector<Resource>&& _resources)
+{
+  resources.reserve(_resources.size());
+  foreach (Resource& resource, _resources) {
+    // NOTE: Invalid and zero Resource objects will be ignored.
+    *this += std::move(resource);
+  }
+}
+
+
 Resources::Resources(const RepeatedPtrField<Resource>& _resources)
 {
   resources.reserve(_resources.size());
   foreach (const Resource& resource, _resources) {
     // NOTE: Invalid and zero Resource objects will be ignored.
     *this += resource;
+  }
+}
+
+
+Resources::Resources(RepeatedPtrField<Resource>&& _resources)
+{
+  resources.reserve(_resources.size());
+  foreach (Resource& resource, _resources) {
+    // NOTE: Invalid and zero Resource objects will be ignored.
+    *this += std::move(resource);
   }
 }
 
@@ -1613,23 +1667,12 @@ Resources Resources::createStrippedScalarQuantity() const
 
   foreach (const Resource& resource, resources) {
     if (resource.type() == Value::SCALAR) {
-      Resource scalar = resource;
-      scalar.clear_provider_id();
-      scalar.clear_allocation_info();
+      Resource scalar;
 
-      // We collapse the stack of reservations here to a single `STATIC`
-      // reservation in order to maintain existing behavior of ignoring
-      // the reservation type, and keeping the reservation role.
-      if (Resources::isReserved(scalar)) {
-        Resource::ReservationInfo collapsedReservation;
-        collapsedReservation.set_type(Resource::ReservationInfo::STATIC);
-        collapsedReservation.set_role(Resources::reservationRole(scalar));
-        scalar.clear_reservations();
-        scalar.add_reservations()->CopyFrom(collapsedReservation);
-      }
+      scalar.set_name(resource.name());
+      scalar.set_type(resource.type());
+      scalar.mutable_scalar()->CopyFrom(resource.scalar());
 
-      scalar.clear_disk();
-      scalar.clear_shared();
       stripped.add(scalar);
     }
   }
@@ -1960,7 +2003,7 @@ bool Resources::operator!=(const Resources& that) const
 }
 
 
-Resources Resources::operator+(const Resource_& that) const
+Resources Resources::operator+(const Resource& that) const &
 {
   Resources result = *this;
   result += that;
@@ -1968,7 +2011,31 @@ Resources Resources::operator+(const Resource_& that) const
 }
 
 
-Resources Resources::operator+(const Resource& that) const
+Resources Resources::operator+(const Resource& that) &&
+{
+  Resources result = std::move(*this);
+  result += that;
+  return result;
+}
+
+
+Resources Resources::operator+(Resource&& that) const &
+{
+  Resources result = *this;
+  result += std::move(that);
+  return result;
+}
+
+
+Resources Resources::operator+(Resource&& that) &&
+{
+  Resources result = std::move(*this);
+  result += std::move(that);
+  return result;
+}
+
+
+Resources Resources::operator+(const Resources& that) const &
 {
   Resources result = *this;
   result += that;
@@ -1976,10 +2043,26 @@ Resources Resources::operator+(const Resource& that) const
 }
 
 
-Resources Resources::operator+(const Resources& that) const
+Resources Resources::operator+(const Resources& that) &&
 {
-  Resources result = *this;
+  Resources result = std::move(*this);
   result += that;
+  return result;
+}
+
+
+Resources Resources::operator+(Resources&& that) const &
+{
+  Resources result = std::move(that);
+  result += *this;
+  return result;
+}
+
+
+Resources Resources::operator+(Resources&& that) &&
+{
+  Resources result = std::move(*this);
+  result += std::move(that);
   return result;
 }
 
@@ -2006,6 +2089,28 @@ void Resources::add(const Resource_& that)
 }
 
 
+void Resources::add(Resource_&& that)
+{
+  if (that.isEmpty()) {
+    return;
+  }
+
+  bool found = false;
+  foreach (Resource_& resource_, resources) {
+    if (internal::addable(resource_.resource, that)) {
+      resource_ += that;
+      found = true;
+      break;
+    }
+  }
+
+  // Cannot be combined with any existing Resource object.
+  if (!found) {
+    resources.push_back(std::move(that));
+  }
+}
+
+
 Resources& Resources::operator+=(const Resource_& that)
 {
   if (that.validate().isNone()) {
@@ -2016,9 +2121,27 @@ Resources& Resources::operator+=(const Resource_& that)
 }
 
 
+Resources& Resources::operator+=(Resource_&& that)
+{
+  if (that.validate().isNone()) {
+    add(std::move(that));
+  }
+
+  return *this;
+}
+
+
 Resources& Resources::operator+=(const Resource& that)
 {
   *this += Resource_(that);
+
+  return *this;
+}
+
+
+Resources& Resources::operator+=(Resource&& that)
+{
+  *this += Resource_(std::move(that));
 
   return *this;
 }
@@ -2034,11 +2157,13 @@ Resources& Resources::operator+=(const Resources& that)
 }
 
 
-Resources Resources::operator-(const Resource_& that) const
+Resources& Resources::operator+=(Resources&& that)
 {
-  Resources result = *this;
-  result -= that;
-  return result;
+  foreach (Resource_& resource_, that.resources) {
+    add(std::move(resource_));
+  }
+
+  return *this;
 }
 
 
@@ -2133,14 +2258,14 @@ ostream& operator<<(ostream& stream, const Resource::DiskInfo::Source& source)
       return stream
         << "MOUNT"
         << ((source.has_id() || source.has_profile())
-              ? "(" + source.id() + "," + source.profile() + ")" : "")
-        << (source.mount().has_root() ? ":" + source.mount().root() : "");
+              ? "(" + source.id() + "," + source.profile() + ")"
+              : (source.mount().has_root() ? ":" + source.mount().root() : ""));
     case Resource::DiskInfo::Source::PATH:
       return stream
         << "PATH"
         << ((source.has_id() || source.has_profile())
-              ? "(" + source.id() + "," + source.profile() + ")" : "")
-        << (source.path().has_root() ? ":" + source.path().root() : "");
+              ? "(" + source.id() + "," + source.profile() + ")"
+              : (source.path().has_root() ? ":" + source.path().root() : ""));
     case Resource::DiskInfo::Source::BLOCK:
       return stream
         << "BLOCK"

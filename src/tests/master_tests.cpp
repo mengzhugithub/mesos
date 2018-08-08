@@ -51,6 +51,7 @@
 
 #include "master/flags.hpp"
 #include "master/master.hpp"
+#include "master/metrics.hpp"
 #include "master/registry_operations.hpp"
 
 #include "master/allocator/mesos/allocator.hpp"
@@ -114,6 +115,7 @@ using std::string;
 using std::vector;
 
 using testing::_;
+using testing::AllOf;
 using testing::AtMost;
 using testing::DoAll;
 using testing::Eq;
@@ -745,11 +747,15 @@ TEST_F(MasterTest, StatusUpdateAck)
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
   ASSERT_SOME(slave);
 
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+
   MockScheduler sched;
   MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _));
+  FrameworkID frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(SaveArg<1>(&frameworkId));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -790,6 +796,25 @@ TEST_F(MasterTest, StatusUpdateAck)
 
   // Ensure the slave gets a status update ACK.
   AWAIT_READY(acknowledgement);
+
+  JSON::Object metrics = Metrics();
+
+  frameworkInfo.mutable_id()->CopyFrom(frameworkId);
+
+  const string prefix = master::getFrameworkMetricPrefix(frameworkInfo);
+
+  EXPECT_EQ(2, metrics.values[prefix + "calls"]);
+  EXPECT_EQ(1, metrics.values[prefix + "calls/accept"]);
+  EXPECT_EQ(1, metrics.values[prefix + "calls/acknowledge"]);
+
+  EXPECT_EQ(1, metrics.values[prefix + "offers/accepted"]);
+
+  EXPECT_EQ(1, metrics.values[prefix + "operations"]);
+  EXPECT_EQ(1, metrics.values[prefix + "operations/launch"]);
+
+  EXPECT_EQ(1, metrics.values[prefix + "events/update"]);
+
+  EXPECT_EQ(1, metrics.values[prefix + "tasks/active/task_running"]);
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -1342,7 +1367,7 @@ TEST_F(MasterTest, MasterInfoOnReElection)
   Clock::advance(masterFlags.allocation_interval);
   Clock::resume();
 
-  // The re-registered framework should get offers.
+  // The reregistered framework should get offers.
   AWAIT_READY(resourceOffers2);
 
   driver.stop();
@@ -1357,7 +1382,7 @@ protected:
     : path("whitelist.txt")
   {}
 
-  virtual ~WhitelistTest()
+  ~WhitelistTest() override
   {
     os::rm(path);
   }
@@ -2268,6 +2293,7 @@ TEST_F(MasterTest, MetricsInMetricsEndpoint)
   EXPECT_EQ(1u, snapshot.values.count("master/messages_decline_offers"));
   EXPECT_EQ(1u, snapshot.values.count("master/messages_revive_offers"));
   EXPECT_EQ(1u, snapshot.values.count("master/messages_suppress_offers"));
+  EXPECT_EQ(1u, snapshot.values.count("master/messages_reconcile_operations"));
   EXPECT_EQ(1u, snapshot.values.count("master/messages_reconcile_tasks"));
   EXPECT_EQ(1u, snapshot.values.count("master/messages_framework_to_executor"));
 
@@ -2402,7 +2428,7 @@ TEST_F(MasterTest, SlavesEndpointFiltering)
   master::Flags flags = CreateMasterFlags();
 
   {
-    mesos::ACL::ViewRole* acl = flags.acls.get().add_view_roles();
+    mesos::ACL::ViewRole* acl = flags.acls->add_view_roles();
     acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL_2.principal());
     acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
   }
@@ -2506,8 +2532,7 @@ TEST_F(MasterTest, SlavesEndpointTwoSlaves)
   AWAIT_READY(slave1RegisteredMessage);
 
   Future<SlaveRegisteredMessage> slave2RegisteredMessage =
-    FUTURE_PROTOBUF(
-        SlaveRegisteredMessage(), master.get()->pid, Not(slave1.get()->pid));
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, Not(slave1.get()->pid));
 
   Try<Owned<cluster::Slave>> slave2 = StartSlave(detector.get());
   ASSERT_SOME(slave2);
@@ -2561,10 +2586,7 @@ TEST_F(MasterTest, SlavesEndpointQuerySlave)
   AWAIT_READY(slave1RegisteredMessage);
 
   Future<SlaveRegisteredMessage> slave2RegisteredMessage =
-    FUTURE_PROTOBUF(
-        SlaveRegisteredMessage(),
-        master.get()->pid,
-        Not(slave1.get()->pid));
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, Not(slave1.get()->pid));
 
   Try<Owned<cluster::Slave>> slave2 = StartSlave(detector.get());
   ASSERT_SOME(slave2);
@@ -2659,6 +2681,8 @@ TEST_F(MasterTest, SlavesEndpointQuerySlave)
 // slave re-registration.
 TEST_F(MasterTest, RegistryUpdateAfterReconfiguration)
 {
+  Clock::pause();
+
   // Start a master.
   master::Flags masterFlags = CreateMasterFlags();
   masterFlags.registry = "replicated_log";
@@ -2677,6 +2701,7 @@ TEST_F(MasterTest, RegistryUpdateAfterReconfiguration)
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
   ASSERT_SOME(slave);
 
+  Clock::advance(slaveFlags.registration_backoff_factor);
   AWAIT_READY(slaveRegisteredMessage);
 
   // Restart slave with changed resources.
@@ -2691,6 +2716,7 @@ TEST_F(MasterTest, RegistryUpdateAfterReconfiguration)
   slave = StartSlave(detector.get(), slaveFlags);
   ASSERT_SOME(slave);
 
+  Clock::advance(slaveFlags.registration_backoff_factor);
   AWAIT_READY(slaveReregisteredMessage);
 
   // Verify master has correctly updated the slave state.
@@ -2911,9 +2937,9 @@ TEST_F(MasterTest, RegistryUpdateAfterMasterFailover)
 
 
 // This test ensures that when a slave is recovered from the registry
-// but does not re-register with the master, it is marked unreachable
+// but does not reregister with the master, it is marked unreachable
 // in the registry, the framework is informed that the slave is lost,
-// and the slave is allowed to re-register.
+// and the slave is allowed to reregister.
 TEST_F(MasterTest, RecoveredSlaveCanReregister)
 {
   // Step 1: Start a master.
@@ -2979,11 +3005,11 @@ TEST_F(MasterTest, RecoveredSlaveCanReregister)
 
   Clock::resume();
 
-  // Step 7: Ensure the slave can re-register.
+  // Step 7: Ensure the slave can reregister.
   Future<SlaveReregisteredMessage> slaveReregisteredMessage =
     FUTURE_PROTOBUF(SlaveReregisteredMessage(), master.get()->pid, _);
 
-  // Expect a resource offer from the re-registered slave.
+  // Expect a resource offer from the reregistered slave.
   Future<Nothing> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureSatisfy(&offers));
@@ -3069,14 +3095,14 @@ TEST_F(MasterTest, UnreachableTaskAfterFailover)
   AWAIT_READY(statusUpdateAck2);
 
   // Step 4: Simulate master failover. We leave the slave without a
-  // master so it does not attempt to re-register.
+  // master so it does not attempt to reregister.
   slaveDetector.appoint(None());
 
   master->reset();
   master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
-  // Cause the scheduler to re-register with the master.
+  // Cause the scheduler to reregister with the master.
   Future<Nothing> disconnected;
   EXPECT_CALL(sched, disconnected(&driver))
     .WillOnce(FutureSatisfy(&disconnected));
@@ -3121,7 +3147,7 @@ TEST_F(MasterTest, UnreachableTaskAfterFailover)
   EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, reconcileUpdate1->reason());
   EXPECT_EQ(unreachableTime, reconcileUpdate1->unreachable_time());
 
-  // Cause the slave to re-register with the master.
+  // Cause the slave to reregister with the master.
   Future<SlaveReregisteredMessage> slaveReregisteredMessage =
     FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
 
@@ -3237,7 +3263,7 @@ TEST_F(MasterTest, RateLimitRecoveredSlaveRemoval)
 
 
 // This test ensures that slave removals that get scheduled during
-// master recovery can be canceled if the slave re-registers.
+// master recovery can be canceled if the slave reregisters.
 TEST_F(MasterTest, CancelRecoveredSlaveRemoval)
 {
   // Start a master.
@@ -3306,7 +3332,7 @@ TEST_F(MasterTest, CancelRecoveredSlaveRemoval)
   Clock::settle();
   ASSERT_TRUE(slaveLost.isPending());
 
-  // Ignore resource offers from the re-registered slave.
+  // Ignore resource offers from the reregistered slave.
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillRepeatedly(Return());
 
@@ -3332,7 +3358,7 @@ TEST_F(MasterTest, CancelRecoveredSlaveRemoval)
 
 
 // This test ensures that when a slave is recovered from the registry
-// and re-registers with the master, it is *not* removed after the
+// and reregisters with the master, it is *not* removed after the
 // re-registration timeout elapses.
 TEST_F(MasterTest, RecoveredSlaveReregisters)
 {
@@ -3374,7 +3400,7 @@ TEST_F(MasterTest, RecoveredSlaveReregisters)
     .WillOnce(FutureSatisfy(&registered));
 
   // Ignore all offer related calls. The scheduler might receive
-  // offerRescinded calls because the slave might re-register due to
+  // offerRescinded calls because the slave might reregister due to
   // ping timeout.
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillRepeatedly(Return());
@@ -3594,7 +3620,7 @@ TEST_F(MasterZooKeeperTest, MasterInfoAddress)
 
 
 // This test ensures that when a master fails over, tasks that belong
-// to frameworks that have not re-registered will be reported in the
+// to frameworks that have not reregistered will be reported in the
 // "/state" endpoint. The framework itself should have the "recovered"
 // field set to true.
 TEST_F(MasterTest, RecoveredFramework)
@@ -3760,7 +3786,7 @@ TEST_F(MasterTest, RecoveredFramework)
   Future<FrameworkRegisteredMessage> frameworkRegisteredMessage =
     FUTURE_PROTOBUF(FrameworkRegisteredMessage(), _, _);
 
-  // Advance the clock to let the framework re-register with the master.
+  // Advance the clock to let the framework reregister with the master.
   Clock::advance(Seconds(1));
   Clock::settle();
   Clock::resume();
@@ -3813,7 +3839,7 @@ TEST_F(MasterTest, RecoveredFramework)
 }
 
 
-// This test verifies that a framework that has not yet re-registered
+// This test verifies that a framework that has not yet reregistered
 // after a master failover doesn't show up multiple times in
 // "frameworks" when querying "/state" or "/frameworks" endpoints. This
 // is to catch any regressions for MESOS-4973 and MESOS-6461.
@@ -4342,13 +4368,15 @@ TEST_F(MasterTest, OfferTimeout)
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
   ASSERT_SOME(slave);
 
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+
   MockScheduler sched;
   MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  Future<Nothing> registered;
+  FrameworkID frameworkId;
   EXPECT_CALL(sched, registered(&driver, _, _))
-    .WillOnce(FutureSatisfy(&registered));
+    .WillOnce(SaveArg<1>(&frameworkId));
 
   Future<vector<Offer>> offers1;
   Future<vector<Offer>> offers2;
@@ -4366,7 +4394,6 @@ TEST_F(MasterTest, OfferTimeout)
 
   driver.start();
 
-  AWAIT_READY(registered);
   AWAIT_READY(offers1);
   ASSERT_EQ(1u, offers1->size());
 
@@ -4391,6 +4418,16 @@ TEST_F(MasterTest, OfferTimeout)
   ASSERT_EQ(1u, offers2->size());
 
   EXPECT_EQ(offers1.get()[0].resources(), offers2.get()[0].resources());
+
+  JSON::Object metrics = Metrics();
+
+  frameworkInfo.mutable_id()->CopyFrom(frameworkId);
+
+  const string prefix = master::getFrameworkMetricPrefix(frameworkInfo);
+
+  EXPECT_EQ(0, metrics.values[prefix + "offers/accepted"]);
+  EXPECT_EQ(2, metrics.values[prefix + "offers/sent"]);
+  EXPECT_EQ(1, metrics.values[prefix + "offers/rescinded"]);
 
   driver.stop();
   driver.join();
@@ -5040,10 +5077,18 @@ TEST_F(MasterTest, StateEndpointAgentCapabilities)
   ASSERT_EQ(1u, slaveInfo.values.count("capabilities"));
   JSON::Value slaveCapabilities = slaveInfo.values.at("capabilities");
 
-  // Agents should always have MULTI_ROLE, HIERARCHICAL_ROLE, and
-  // RESERVATION_REFINEMENT capabilities in current implementation.
+  // Agents should have the following capabilities in the current
+  // implementation.
   Try<JSON::Value> expectedCapabilities = JSON::parse(
-      "[\"MULTI_ROLE\",\"HIERARCHICAL_ROLE\",\"RESERVATION_REFINEMENT\"]");
+    R"~(
+      [
+        "MULTI_ROLE",
+        "HIERARCHICAL_ROLE",
+        "RESERVATION_REFINEMENT",
+        "RESOURCE_PROVIDER",
+        "RESIZE_VOLUME"
+      ]
+    )~");
 
   ASSERT_SOME(expectedCapabilities);
   EXPECT_TRUE(slaveCapabilities.contains(expectedCapabilities.get()));
@@ -5241,14 +5286,14 @@ TEST_F(MasterTest, RecoveredSlaves)
   Future<SlaveReregisteredMessage> slaveReregisteredMessage =
     FUTURE_PROTOBUF(SlaveReregisteredMessage(), master.get()->pid, _);
 
-  // Start the agent to make it re-register with the master.
+  // Start the agent to make it reregister with the master.
   detector = master.get()->createDetector();
   slave = StartSlave(detector.get(), slaveFlags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(slaveReregisteredMessage);
 
-  // After the agent has successfully re-registered with the master, the
+  // After the agent has successfully reregistered with the master, the
   // `recovered_slaves` field would be empty in both `/state` and `slave`
   // endpoints.
 
@@ -6010,11 +6055,15 @@ TEST_F(MasterTest, MasterFailoverLongLivedExecutor)
     StartSlave(&detector, &containerizer, flags);
   ASSERT_SOME(slave);
 
-  MockScheduler sched;
-  TestingMesosSchedulerDriver driver(&sched, &detector);
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
 
+  MockScheduler sched;
+  TestingMesosSchedulerDriver driver(&sched, &detector, frameworkInfo);
+
+  Future<FrameworkID> frameworkId;
   EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(2);
+    .WillOnce(FutureArg<1>(&frameworkId))
+    .WillOnce(Return());
 
   EXPECT_CALL(sched, disconnected(&driver));
 
@@ -6052,6 +6101,15 @@ TEST_F(MasterTest, MasterFailoverLongLivedExecutor)
   AWAIT_READY(status1);
   EXPECT_EQ(TASK_RUNNING, status1->state());
 
+  AWAIT_ASSERT_READY(frameworkId);
+
+  frameworkInfo.mutable_id()->CopyFrom(frameworkId.get());
+
+  const string metricPrefix = master::getFrameworkMetricPrefix(frameworkInfo);
+
+  JSON::Object metrics1 = Metrics();
+  EXPECT_EQ(1, metrics1.values[metricPrefix + "tasks/active/task_running"]);
+
   // Fail over master.
   master->reset();
   master = StartMaster();
@@ -6069,6 +6127,9 @@ TEST_F(MasterTest, MasterFailoverLongLivedExecutor)
   AWAIT_READY(offers2);
   ASSERT_FALSE(offers2->empty());
 
+  JSON::Object metrics2 = Metrics();
+  EXPECT_EQ(1, metrics2.values[metricPrefix + "tasks/active/task_running"]);
+
   // The second task is a just a copy of the first task (using the
   // same executor and resources). We have to set a new task id.
   TaskInfo task2 = task1;
@@ -6084,6 +6145,9 @@ TEST_F(MasterTest, MasterFailoverLongLivedExecutor)
 
   AWAIT_READY(status2);
   EXPECT_EQ(TASK_RUNNING, status2->state());
+
+  JSON::Object metrics3 = Metrics();
+  EXPECT_EQ(2, metrics3.values[metricPrefix + "tasks/active/task_running"]);
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -6115,7 +6179,7 @@ TEST_F(MasterTest, DuplicatedSlaveIdWhenSlaveReregister)
   ASSERT_SOME(master);
 
   Future<SlaveRegisteredMessage> slaveRegisteredMessage2 =
-      FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, Not(slave1.get()->pid));
 
   // Start a new slave and make sure it registers before the old slave.
   slave::Flags slaveFlags2 = CreateSlaveFlags();
@@ -6129,7 +6193,7 @@ TEST_F(MasterTest, DuplicatedSlaveIdWhenSlaveReregister)
   Future<SlaveReregisteredMessage> slaveReregisteredMessage1 =
       FUTURE_PROTOBUF(SlaveReregisteredMessage(), master.get()->pid, _);
 
-  // Now let the first slave re-register.
+  // Now let the first slave reregister.
   slaveDetector1.appoint(master.get()->pid);
 
   // If both the slaves get the same SlaveID, the re-registration would
@@ -6474,6 +6538,8 @@ TEST_F(MasterTest, MaxCompletedFrameworksFlag)
   const size_t totalFrameworks = 2;
   const size_t maxFrameworksArray[] = {0, 1, 2};
 
+  const string ROLE = "foo";
+
   foreach (const size_t maxFrameworks, maxFrameworksArray) {
     master::Flags masterFlags = CreateMasterFlags();
     masterFlags.max_completed_frameworks = maxFrameworks;
@@ -6485,11 +6551,18 @@ TEST_F(MasterTest, MaxCompletedFrameworksFlag)
     Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
     ASSERT_SOME(slave);
 
+    // This is used to check per-framework metrics.
+    vector<FrameworkInfo> frameworkInfos;
+
     for (size_t i = 0; i < totalFrameworks; i++) {
+      FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+      frameworkInfo.clear_roles();
+      frameworkInfo.add_roles(ROLE);
+
       MockScheduler sched;
       MesosSchedulerDriver schedDriver(
           &sched,
-          DEFAULT_FRAMEWORK_INFO,
+          frameworkInfo,
           master.get()->pid,
           DEFAULT_CREDENTIAL);
 
@@ -6497,13 +6570,16 @@ TEST_F(MasterTest, MaxCompletedFrameworksFlag)
       EXPECT_CALL(sched, resourceOffers(_, _))
         .WillRepeatedly(Return());
 
-      Future<Nothing> schedRegistered;
+      Future<FrameworkID> frameworkId;
       EXPECT_CALL(sched, registered(_, _, _))
-        .WillOnce(FutureSatisfy(&schedRegistered));
+        .WillOnce(FutureArg<1>(&frameworkId));
 
       schedDriver.start();
 
-      AWAIT_READY(schedRegistered);
+      AWAIT_READY(frameworkId);
+
+      frameworkInfo.mutable_id()->CopyFrom(frameworkId.get());
+      frameworkInfos.push_back(frameworkInfo);
 
       schedDriver.stop();
       schedDriver.join();
@@ -6526,6 +6602,23 @@ TEST_F(MasterTest, MaxCompletedFrameworksFlag)
       state.values["completed_frameworks"].as<JSON::Array>();
 
     EXPECT_EQ(maxFrameworks, completedFrameworks->values.size());
+
+    // The first `evictedFrameworks` schedulers in the list should have their
+    // per-framework metrics GC'd, both from the master and the allocator. We
+    // check the 'suppressed' metric because it resides in the allocator.
+    const size_t evictedFrameworks = totalFrameworks - maxFrameworks;
+    JSON::Object metrics = Metrics();
+    for (size_t i = 0; i < totalFrameworks; i++) {
+      const string prefix = master::getFrameworkMetricPrefix(frameworkInfos[i]);
+      if (i < evictedFrameworks) {
+        EXPECT_NONE(metrics.at<JSON::Number>(prefix + "calls"));
+        EXPECT_NONE(metrics.at<JSON::Number>(
+            prefix + "roles/" + ROLE + "/suppressed"));
+      } else {
+        EXPECT_EQ(0, metrics.values[prefix + "subscribed"]);
+        EXPECT_EQ(0, metrics.values[prefix + "roles/" + ROLE + "/suppressed"]);
+      }
+    }
   }
 }
 
@@ -6859,6 +6952,8 @@ TEST_F(MasterTest, RejectFrameworkWithInvalidFailoverTimeout)
 
 // This test verifies that we recover resources when an orphaned task reaches
 // a terminal state.
+//
+// TODO(alexr): Enable after MESOS-6623 is resolved.
 TEST_F(MasterTest, DISABLED_RecoverResourcesOrphanedTask)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
@@ -6974,7 +7069,7 @@ TEST_F(MasterTest, DISABLED_RecoverResourcesOrphanedTask)
 
   AWAIT_READY(disconnected);
 
-  // Have the agent re-register with the master.
+  // Have the agent reregister with the master.
   detector.appoint(master.get()->pid);
 
   // Ensure re-registration is complete.
@@ -7051,7 +7146,7 @@ TEST_F(MasterTest, DISABLED_RecoverResourcesOrphanedTask)
 
     ASSERT_TRUE(tasks.IsInitialized());
     ASSERT_EQ(1, tasks.tasks().size());
-    EXPECT_EQ(TASK_FINISHED, tasks.tasks(0).state());
+    EXPECT_EQ(v1::TASK_FINISHED, tasks.tasks(0).state());
     EXPECT_TRUE(tasks.orphan_tasks().empty());
     EXPECT_TRUE(tasks.completed_tasks().empty());
   }
@@ -7066,7 +7161,7 @@ TEST_F(MasterTest, DISABLED_RecoverResourcesOrphanedTask)
 
 // This test checks that the "/state" endpoint displays the correct
 // information when the master fails over and an agent running one of
-// the framework's tasks re-registers before the framework does.
+// the framework's tasks reregisters before the framework does.
 TEST_F(MasterTest, FailoverAgentReregisterFirst)
 {
   master::Flags masterFlags = CreateMasterFlags();
@@ -7127,7 +7222,7 @@ TEST_F(MasterTest, FailoverAgentReregisterFirst)
   AWAIT_READY(statusUpdateAck2);
 
   // Simulate master failover. We leave the scheduler without a master
-  // so it does not attempt to re-register yet.
+  // so it does not attempt to reregister yet.
   EXPECT_CALL(sched, disconnected(&driver));
 
   schedDetector.appoint(None());
@@ -7145,7 +7240,7 @@ TEST_F(MasterTest, FailoverAgentReregisterFirst)
   AWAIT_READY(slaveReregisteredMessage);
 
   // Check the master's "/state" endpoint. Because the slave has
-  // re-registered, the master should know about the framework but
+  // reregistered, the master should know about the framework but
   // view it as disconnected and inactive.
   {
     Future<Response> response = process::http::get(
@@ -7188,7 +7283,7 @@ TEST_F(MasterTest, FailoverAgentReregisterFirst)
     EXPECT_TRUE(completedFrameworks.values.empty());
   }
 
-  // Cause the scheduler to re-register. We pause the clock to ensure
+  // Cause the scheduler to reregister. We pause the clock to ensure
   // the re-registration time is predictable. We get a "registered"
   // callback in the scheduler driver because of MESOS-786.
   Future<Nothing> registered;
@@ -7250,7 +7345,7 @@ TEST_F(MasterTest, FailoverAgentReregisterFirst)
 
     // The state endpoint does not return "reregistered_time" if it is
     // the same as "registered_time".
-    EXPECT_EQ(0, framework.values.count("reregistered_time"));
+    EXPECT_EQ(0u, framework.values.count("reregistered_time"));
 
     JSON::Array unregisteredFrameworks =
       parse->values["unregistered_frameworks"].as<JSON::Array>();
@@ -7269,7 +7364,7 @@ TEST_F(MasterTest, FailoverAgentReregisterFirst)
 
 
 // In this test, an agent restarts, responds to pings, but does not
-// re-register with the master; the master should mark the agent
+// reregister with the master; the master should mark the agent
 // unreachable after waiting for `agent_reregister_timeout`. In
 // practice, this typically happens because agent recovery hangs; to
 // simplify the test case, we instead drop the agent -> master
@@ -7299,7 +7394,7 @@ TEST_F(MasterTest, AgentRestartNoReregister)
 
   // We use the same UPID when we restart the agent below, so that the
   // agent continues to receive pings from the master before it
-  // successfully re-registers.
+  // successfully reregisters.
   const string agentPid = "agent";
 
   Try<Owned<cluster::Slave>> slave =
@@ -7382,7 +7477,7 @@ TEST_F(MasterTest, AgentRestartNoReregister)
   slave = StartSlave(&detector, containerizer.get(), agentPid, agentFlags);
   ASSERT_SOME(slave);
 
-  // Wait for the executor to re-register.
+  // Wait for the executor to reregister.
   AWAIT_READY(reregisterExecutorMessage);
 
   // The agent waits for the executor reregister timeout to expire,
@@ -7390,7 +7485,7 @@ TEST_F(MasterTest, AgentRestartNoReregister)
   Clock::advance(agentFlags.executor_reregistration_timeout);
   Clock::settle();
 
-  // Agent will try to re-register after completing recovery; prevent
+  // Agent will try to reregister after completing recovery; prevent
   // this from succeeding by dropping the re-reregistration message.
   Clock::advance(agentFlags.registration_backoff_factor);
   AWAIT_READY(reregisterSlave1);
@@ -7475,7 +7570,7 @@ TEST_F(MasterTest, AgentRestartNoReregister)
 }
 
 
-// When removing agents that haven't re-registered after a socket
+// When removing agents that haven't reregistered after a socket
 // error (see notes in `AgentRestartNoReregister`) above, this test
 // checks that the master respects the agent removal rate limit.
 TEST_F(MasterTest, AgentRestartNoReregisterRateLimit)
@@ -7501,7 +7596,7 @@ TEST_F(MasterTest, AgentRestartNoReregisterRateLimit)
 
   // We use the same UPID when we restart the agent below, so that the
   // agent continues to receive pings from the master before it
-  // successfully re-registers.
+  // successfully reregisters.
   const string agentPid = "agent";
 
   Try<Owned<cluster::Slave>> slave =
@@ -7544,7 +7639,7 @@ TEST_F(MasterTest, AgentRestartNoReregisterRateLimit)
   slave = StartSlave(&detector, containerizer.get(), agentPid, agentFlags);
   ASSERT_SOME(slave);
 
-  // Agent will try to re-register after completing recovery; prevent
+  // Agent will try to reregister after completing recovery; prevent
   // this from succeeding by dropping the re-reregistration message.
   Clock::advance(agentFlags.registration_backoff_factor);
   AWAIT_READY(reregisterSlave);
@@ -7697,10 +7792,13 @@ TEST_F(MasterTest, TaskWithTinyResources)
 
   Offer offer = offers.get()[0];
 
-  TaskInfo task = createTask(
-      offer.slave_id(),
-      Resources::parse("cpus:0.00001;mem:1").get(),
-      SLEEP_COMMAND(1000));
+  // We manually construct the CPU resources since the parser constructing
+  // `Resources` instead of `Resource` already performs validation and would
+  // reject the input.
+  Resources resources = Resources::parse("mem:1").get();
+  resources += Resources::parse("cpus", "0.00001", "*").get();
+
+  TaskInfo task = createTask(offer.slave_id(), resources, SLEEP_COMMAND(1000));
 
   Future<TaskStatus> startingStatus;
   Future<TaskStatus> runningStatus;
@@ -7789,6 +7887,13 @@ TEST_F(MasterTest, MultiRoleSchedulerUnsubscribeFromRole)
   AWAIT_READY(offers);
   ASSERT_EQ(1u, offers->size());
 
+  frameworkInfo.mutable_id()->CopyFrom(frameworkId.get());
+
+  const string prefix = master::getFrameworkMetricPrefix(frameworkInfo);
+
+  JSON::Object metrics1 = Metrics();
+  EXPECT_EQ(0, metrics1.values[prefix + "roles/foo/suppressed"]);
+
   Resources resources = Resources::parse("cpus:1;mem:512").get();
 
   Offer offer = offers.get()[0];
@@ -7813,7 +7918,6 @@ TEST_F(MasterTest, MultiRoleSchedulerUnsubscribeFromRole)
 
   // Remove the role from the framework.
 
-  frameworkInfo.mutable_id()->CopyFrom(frameworkId.get());
   frameworkInfo.clear_roles();
 
   MockScheduler sched2;
@@ -7838,6 +7942,9 @@ TEST_F(MasterTest, MultiRoleSchedulerUnsubscribeFromRole)
   Clock::advance(masterFlags.allocation_interval);
 
   AWAIT_READY(registered2);
+
+  JSON::Object metrics2 = Metrics();
+  EXPECT_NONE(metrics2.at<JSON::Number>(prefix + "roles/foo/suppressed"));
 
   // Wait for the agent to get the updated framework info.
   AWAIT_READY(updateFrameworkMessage);
@@ -7948,7 +8055,7 @@ TEST_F(MasterTest, MultiRoleSchedulerUnsubscribeFromRole)
         JSON::Array {
           JSON::Object {
             { "name", "foo" },
-            { "frameworks", JSON::Array { frameworkId.get().value() } }
+            { "frameworks", JSON::Array { frameworkId->value() } }
           }
         }
       }
@@ -8259,7 +8366,7 @@ TEST_F(MasterTest, RegistrationWithoutRequiredAgentDomain)
 
 
 // This test checks that if the `--require_agent_domain` flag is set and
-// the agent does not have a domain configured when trying to re-register,
+// the agent does not have a domain configured when trying to reregister,
 // the re-registration attempt will fail.
 TEST_F(MasterTest, ReregistrationWithoutRequiredAgentDomain)
 {
@@ -8286,7 +8393,7 @@ TEST_F(MasterTest, ReregistrationWithoutRequiredAgentDomain)
 
   AWAIT_READY(slaveRegisteredMessage);
 
-  // Shut down slave and re-register without domain. We do this by
+  // Shut down slave and reregister without domain. We do this by
   // intercepting the `ReregisterSlaveMessage` and erasing the domain
   // before passing it on to the master.
   Future<ReregisterSlaveMessage> reregisterSlaveMessage =
@@ -8316,7 +8423,7 @@ TEST_F(MasterTest, ReregistrationWithoutRequiredAgentDomain)
 
 
 // This test checks that if the agent is configured with a domain but
-// the master is not, the agent is not allowed to re-register. This
+// the master is not, the agent is not allowed to reregister. This
 // might happen if the leading master is configured with a domain but
 // one of the standby masters is not, and then the leader fails over.
 TEST_F(MasterTest, AgentDomainMismatchOnReregister)
@@ -8354,7 +8461,7 @@ TEST_F(MasterTest, AgentDomainMismatchOnReregister)
   Future<ReregisterSlaveMessage> reregisterSlaveMessage =
     FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
 
-  // If the agent is allowed to re-register, the master will update
+  // If the agent is allowed to reregister, the master will update
   // the registry. The agent should not be allowed to register, so we
   // expect that no registrar operations will be observed.
   EXPECT_CALL(*master.get()->registrar, apply(_))
@@ -8424,7 +8531,7 @@ TEST_F(MasterTest, IgnoreOldAgentRegistration)
 }
 
 
-// Check that the master does not allow old Mesos agents to re-register.
+// Check that the master does not allow old Mesos agents to reregister.
 // We do this by intercepting the agent's `ReregisterSlaveMessage` and
 // then re-sending it with a tweaked version number.
 TEST_F(MasterTest, IgnoreOldAgentReregistration)
@@ -8452,7 +8559,7 @@ TEST_F(MasterTest, IgnoreOldAgentReregistration)
     DROP_PROTOBUF(ReregisterSlaveMessage(), _, _);
 
   // Simulate a new master detected event on the slave,
-  // so that the slave will attempt to re-register.
+  // so that the slave will attempt to reregister.
   detector.appoint(master.get()->pid);
 
   Clock::settle();
@@ -8478,9 +8585,7 @@ TEST_F(MasterTest, IgnoreOldAgentReregistration)
 // This test checks that the master correctly garbage collects
 // information about gone agents from the registry using the
 // count-based GC criterion.
-//
-// TODO(andschwa): Enable this when MESOS-7604 is fixed.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(MasterTest, RegistryGcByCount)
+TEST_F(MasterTest, RegistryGcByCount)
 {
   // Configure GC to only keep the most recent gone agent in the gone list.
   master::Flags masterFlags = CreateMasterFlags();
@@ -8526,8 +8631,10 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(MasterTest, RegistryGcByCount)
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, response);
   }
 
+  // Ensure we catch a brand new `SlaveRegisteredMessage` message
+  // and not the one eventually resent for the first agent.
   Future<SlaveRegisteredMessage> slaveRegisteredMessage2 =
-    FUTURE_PROTOBUF(SlaveRegisteredMessage(), master.get()->pid, _);
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, Not(slave.get()->pid));
 
   slave::Flags slaveFlags2 = CreateSlaveFlags();
 
@@ -8603,8 +8710,631 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(MasterTest, RegistryGcByCount)
   AWAIT_READY(reconcileUpdate1);
   AWAIT_READY(reconcileUpdate2);
 
-  ASSERT_EQ(TASK_UNKNOWN, reconcileUpdate1->state());
-  ASSERT_EQ(TASK_GONE_BY_OPERATOR, reconcileUpdate2->state());
+  EXPECT_EQ(TASK_UNKNOWN, reconcileUpdate1->state());
+  EXPECT_EQ(TASK_GONE_BY_OPERATOR, reconcileUpdate2->state());
+}
+
+
+// This test verifies that updating a resource provider's state
+// that isn't motivated by (re-)registration (e.g. when adding
+// resources) is correctly handled by agent and master: Offers are
+// rescinded and new resources are offered.
+TEST_F(MasterTest, UpdateSlaveMessageWithPendingOffers)
+{
+  Clock::pause();
+
+  // Start master and agent.
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(agent);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+  AWAIT_READY(updateSlaveMessage);
+
+  updateSlaveMessage = FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  mesos::v1::ResourceProviderInfo resourceProviderInfo;
+  resourceProviderInfo.set_type("org.apache.mesos.rp.test");
+  resourceProviderInfo.set_name("test");
+
+  v1::Resource disk1 = v1::createDiskResource(
+      "200", "*", None(), None(), v1::createDiskSourceRaw());
+
+  Owned<v1::MockResourceProvider> resourceProvider(
+      new v1::MockResourceProvider(resourceProviderInfo, v1::Resources(disk1)));
+
+  // Start and register a resource provider with a single disk resources.
+  Owned<EndpointDetector> endpointDetector(
+      resource_provider::createEndpointDetector(agent.get()->pid));
+
+  resourceProvider->start(endpointDetector, ContentType::PROTOBUF);
+
+  AWAIT_READY(updateSlaveMessage);
+  ASSERT_TRUE(resourceProvider->info.has_id());
+
+  disk1.mutable_provider_id()->CopyFrom(resourceProvider->info.id());
+
+  // Start and register a framework.
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
+
+  EXPECT_CALL(*scheduler, subscribed(_, _));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid, ContentType::PROTOBUF, scheduler);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  v1::Resources offeredResources = offers->offers(0).resources();
+  offeredResources.unallocate();
+
+  EXPECT_TRUE(offeredResources.contains(disk1));
+
+  updateSlaveMessage = FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  // Add another resource to the resource provider. By sending
+  // 'UPDATE_STATE', the resource provider manager will be notified
+  // of the new resource.
+  v1::Resource disk2 = v1::createDiskResource(
+      "100", "*", None(), None(), v1::createDiskSourceBlock());
+  disk2.mutable_provider_id()->CopyFrom(resourceProvider->info.id());
+
+  v1::resource_provider::Call call;
+  call.mutable_resource_provider_id()->CopyFrom(resourceProvider->info.id());
+  call.set_type(v1::resource_provider::Call::UPDATE_STATE);
+
+  v1::resource_provider::Call::UpdateState* updateState =
+    call.mutable_update_state();
+  updateState->add_resources()->CopyFrom(disk1);
+  updateState->add_resources()->CopyFrom(disk2);
+  updateState->mutable_resource_version_uuid()->set_value(
+      id::UUID::random().toBytes());
+
+  Future<Nothing> rescinded;
+  EXPECT_CALL(*scheduler, rescind(_, _))
+    .WillOnce(FutureSatisfy(&rescinded));
+
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  resourceProvider->send(call);
+
+  AWAIT_READY(updateSlaveMessage);
+
+  AWAIT_READY(rescinded);
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  offeredResources = offers->offers(0).resources();
+  offeredResources.unallocate();
+
+  EXPECT_TRUE(offeredResources.contains(disk1));
+  EXPECT_TRUE(offeredResources.contains(disk2));
+}
+
+
+// Tests that the master correctly handles resource provider operations
+// that finished during a master failover.
+TEST_F(MasterTest, OperationUpdateDuringFailover)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  StandaloneMasterDetector detector(master.get()->pid);
+  Try<Owned<cluster::Slave>> slave = StartSlave(&detector, slaveFlags);
+  ASSERT_SOME(slave);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  AWAIT_READY(updateSlaveMessage);
+
+  // Register a resource provider with the agent.
+  mesos::v1::ResourceProviderInfo resourceProviderInfo;
+  resourceProviderInfo.set_type("org.apache.mesos.resource_provider.test");
+  resourceProviderInfo.set_name("test");
+
+  v1::Resources resourceProviderResources = v1::createDiskResource(
+      "200",
+      "*",
+      None(),
+      None(),
+      v1::createDiskSourceRaw());
+
+  v1::MockResourceProvider resourceProvider(
+      resourceProviderInfo,
+      resourceProviderResources);
+
+  Owned<EndpointDetector> endpointDetector(
+      resource_provider::createEndpointDetector(slave.get()->pid));
+
+  updateSlaveMessage = FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  resourceProvider.start(endpointDetector, ContentType::PROTOBUF);
+
+  AWAIT_READY(updateSlaveMessage);
+
+  // Start a framework to operate on offers.
+  MockScheduler sched;
+  TestingMesosSchedulerDriver driver(&sched, &detector);
+
+  // Expect a registration as well as a re-registration after master
+  // failover.
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .Times(2);
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+  const Offer& offer = offers->front();
+
+  Option<Resource> rawDisk;
+
+  foreach (const Resource& resource, offer.resources()) {
+    if (resource.has_provider_id() &&
+        resource.has_disk() &&
+        resource.disk().has_source() &&
+        resource.disk().source().type() == Resource::DiskInfo::Source::RAW) {
+      rawDisk = resource;
+      break;
+    }
+  }
+
+  ASSERT_SOME(rawDisk);
+
+  Future<mesos::v1::resource_provider::Event::ApplyOperation> operation;
+  EXPECT_CALL(resourceProvider, applyOperation(_))
+    .WillOnce(FutureArg<0>(&operation));
+
+  driver.acceptOffers(
+      {offer.id()},
+      {CREATE_DISK(rawDisk.get(), Resource::DiskInfo::Source::MOUNT)});
+
+  AWAIT_READY(operation);
+
+  Option<mesos::v1::UUID> operationUUID;
+
+  {
+    v1::master::Call call;
+    call.set_type(v1::master::Call::GET_OPERATIONS);
+
+    process::http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
+    headers["Accept"] = stringify(ContentType::PROTOBUF);
+
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "api/v1",
+        headers,
+        serialize(ContentType::PROTOBUF, call),
+        stringify(ContentType::PROTOBUF));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+
+    Try<v1::master::Response> response_ =
+      deserialize<v1::master::Response>(ContentType::PROTOBUF, response->body);
+
+    ASSERT_SOME(response_);
+    const v1::master::Response::GetOperations& operations =
+      response_->get_operations();
+
+    ASSERT_EQ(1, operations.operations_size());
+    EXPECT_EQ(
+        mesos::v1::OperationState::OPERATION_PENDING,
+        operations.operations(0).latest_status().state());
+
+    operationUUID = operations.operations(0).uuid();
+  }
+
+  CHECK_SOME(operationUUID);
+
+  EXPECT_CALL(sched, disconnected(&driver));
+
+  // Drop the operation update for the finished operation.
+  // As we fail over the master immediately afterwards, we expect
+  // that the operation update will be part of the agent's
+  // `UPDATE_STATE` message when reregistering with the master.
+  Future<UpdateOperationStatusMessage> updateOperationStatusMessage =
+    DROP_PROTOBUF(UpdateOperationStatusMessage(), _, _);
+
+  // Finish the pending operation.
+  resourceProvider.operationDefault(operation.get());
+
+  AWAIT_READY(updateOperationStatusMessage);
+
+  // Fail over the master.
+  master->reset();
+
+  updateSlaveMessage = FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  EXPECT_CALL(sched, offerRescinded(&driver, _))
+    .WillRepeatedly(Return());
+
+  // Start a new master and have agent and framework reconnect.
+  // The reconnected agent should report the converted resources.
+  master = StartMaster(masterFlags);
+  detector.appoint(master.get()->pid);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+
+  AWAIT_READY(updateSlaveMessage);
+
+  {
+    v1::master::Call call;
+    call.set_type(v1::master::Call::GET_OPERATIONS);
+
+    process::http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
+    headers["Accept"] = stringify(ContentType::PROTOBUF);
+
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "api/v1",
+        headers,
+        serialize(ContentType::PROTOBUF, call),
+        stringify(ContentType::PROTOBUF));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+
+    Try<v1::master::Response> response_ =
+      deserialize<v1::master::Response>(ContentType::PROTOBUF, response->body);
+
+    ASSERT_SOME(response_);
+    const v1::master::Response::GetOperations& operations =
+      response_->get_operations();
+
+    ASSERT_EQ(1, operations.operations_size());
+    EXPECT_EQ(
+        mesos::v1::OperationState::OPERATION_FINISHED,
+        operations.operations(0).latest_status().state());
+    EXPECT_EQ(operationUUID.get(), operations.operations(0).uuid());
+  }
+
+  driver.stop();
+  driver.join();
+}
+
+
+// Tests that the master correctly drops an operation if the operation's 'id'
+// field is set and the operation affects resources not managed by a resource
+// provider.
+TEST_F(MasterTest, DropOperationWithIDAffectingDefaultResources)
+{
+  Clock::pause();
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  mesos::internal::slave::Flags slaveFlags = CreateSlaveFlags();
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Advance the clock to trigger agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  // Start a v1 framework.
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, DEFAULT_TEST_ROLE);
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  // Ignore heartbeats.
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return());
+
+  Future<v1::scheduler::Event::Offers> offers;
+
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(v1::scheduler::DeclineOffers());
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid, ContentType::PROTOBUF, scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+
+  Future<v1::scheduler::Event::UpdateOperationStatus> operationErrorUpdate;
+  EXPECT_CALL(*scheduler, updateOperationStatus(_, _))
+    .WillOnce(FutureArg<1>(&operationErrorUpdate));
+
+  v1::Resource reserved = *(offer.resources().begin());
+  reserved.add_reservations()->CopyFrom(
+      v1::createDynamicReservationInfo(
+          frameworkInfo.roles(0), DEFAULT_CREDENTIAL.principal()));
+
+  v1::OperationID operationId;
+  operationId.set_value("operation");
+
+  mesos.send(v1::createCallAccept(
+      frameworkId, offer, {v1::RESERVE(reserved, operationId.value())}));
+
+  // Wait for the framework to receive the OPERATION_ERROR update.
+  AWAIT_READY(operationErrorUpdate);
+
+  EXPECT_EQ(operationId, operationErrorUpdate->status().operation_id());
+  EXPECT_EQ(v1::OPERATION_ERROR, operationErrorUpdate->status().state());
+}
+
+
+// Verifies that both active and terminal per-framework task state metrics
+// report correct values, even after agent reregistration.
+TEST_F(MasterTest, TaskStateMetrics)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Fetcher fetcher(slaveFlags);
+
+  Try<MesosContainerizer*> _containerizer =
+    MesosContainerizer::create(slaveFlags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  Owned<slave::Containerizer> containerizer(_containerizer.get());
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), containerizer.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Advance the clock to trigger agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_checkpoint(true);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<Event::Offers> offers1;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers1));
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+  frameworkInfo.mutable_id()->CopyFrom(frameworkId);
+
+  AWAIT_READY(offers1);
+  ASSERT_FALSE(offers1->offers().empty());
+
+  const v1::Offer& offer1 = offers1->offers(0);
+  const v1::AgentID& agentId = offer1.agent_id();
+
+  // Set `refuse_seconds` to zero so that the remaining resources
+  // are offered again immediately.
+  v1::Filters filters;
+  filters.set_refuse_seconds(0);
+
+  // The first task is long-running.
+  v1::TaskInfo task1 = v1::createTask(
+      agentId,
+      v1::Resources::parse("cpus:0.1;mem:64").get(),
+      SLEEP_COMMAND(300));
+
+  testing::Sequence taskSequence1;
+  Future<Event::Update> runningUpdate;
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(task1),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(taskSequence1)
+    .WillOnce(v1::scheduler::SendAcknowledge(frameworkId, agentId));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(task1),
+          TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(taskSequence1)
+    .WillOnce(DoAll(
+        v1::scheduler::SendAcknowledge(frameworkId, agentId),
+        FutureArg<1>(&runningUpdate)));
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer1,
+          {v1::LAUNCH({task1})},
+          filters));
+
+  AWAIT_READY(runningUpdate);
+
+  Future<Event::Offers> offers2;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers2));
+
+  Clock::advance(masterFlags.allocation_interval);
+
+  AWAIT_READY(offers2);
+  ASSERT_FALSE(offers2->offers().empty());
+
+  const v1::Offer& offer2 = offers2->offers(0);
+
+  // The second task finishes immediately. Its TASK_FINISHED status update is
+  // never acknowledged so that the agent will include the task in its
+  // reregistration message.
+
+  v1::TaskInfo task2 = v1::createTask(
+      agentId,
+      v1::Resources::parse("cpus:0.1;mem:64").get(),
+      "echo done");
+
+  testing::Sequence taskSequence2;
+  Future<Event::Update> finishedUpdate;
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(task2),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(taskSequence2)
+    .WillOnce(v1::scheduler::SendAcknowledge(frameworkId, agentId));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(task2),
+          TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(taskSequence2)
+    .WillOnce(v1::scheduler::SendAcknowledge(frameworkId, agentId));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(task2),
+          TaskStatusUpdateStateEq(v1::TASK_FINISHED))))
+    .InSequence(taskSequence2)
+    .WillOnce(FutureArg<1>(&finishedUpdate))
+    .WillRepeatedly(Return()); // Ignore retries.
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer2,
+          {v1::LAUNCH({task2})},
+          filters));
+
+  AWAIT_READY(finishedUpdate);
+
+  JSON::Object metrics1 = Metrics();
+
+  const string prefix =
+    master::getFrameworkMetricPrefix(devolve(frameworkInfo));
+
+  // Verify global master metrics.
+  EXPECT_EQ(1, metrics1.values["master/tasks_running"]);
+  EXPECT_EQ(1, metrics1.values["master/tasks_finished"]);
+
+  // Verify per-framework metrics.
+  EXPECT_EQ(1, metrics1.values[prefix + "tasks/active/task_running"]);
+  EXPECT_EQ(1, metrics1.values[prefix + "tasks/terminal/task_finished"]);
+
+  // Fail over the agent to ensure that the master's task state metrics
+  // remain correct after agent reregistration.
+  slave.get()->terminate();
+  slave->reset();
+
+  Future<ReregisterExecutorMessage> reregisterExecutorMessage =
+    FUTURE_PROTOBUF(ReregisterExecutorMessage(), _, _);
+  Future<ReregisterSlaveMessage> reregisterSlaveMessage =
+    FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
+  Future<SlaveReregisteredMessage> slaveReregisteredMessage =
+    FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
+
+  // Restart the agent with a new containerizer.
+  _containerizer = MesosContainerizer::create(slaveFlags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  containerizer.reset(_containerizer.get());
+
+  slave = StartSlave(detector.get(), containerizer.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Ensure that the executor has reregistered before we advance the clock,
+  // to avoid timing out the executor.
+  AWAIT_READY(reregisterExecutorMessage);
+
+  // Ensure that agent recovery completes.
+  Clock::advance(slaveFlags.executor_reregistration_timeout);
+  Clock::settle();
+
+  // Ensure that the agent reregisters.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  // Resume the clock to avoid deadlocks related to agent registration.
+  // See MESOS-8828.
+  Clock::resume();
+
+  AWAIT_READY(reregisterSlaveMessage);
+
+  // The agent should provide both of its tasks during reregistration, since one
+  // is still running and the other has an unacknowledged terminal update. We
+  // want to verify that metric values are correct after this occurs.
+  EXPECT_EQ(2, reregisterSlaveMessage->tasks_size());
+
+  AWAIT_READY(slaveReregisteredMessage);
+
+  JSON::Object metrics2 = Metrics();
+
+  // Verify global master metrics.
+  EXPECT_EQ(1, metrics2.values["master/tasks_running"]);
+  EXPECT_EQ(1, metrics2.values["master/tasks_finished"]);
+
+  // Verify per-framework metrics.
+  EXPECT_EQ(1, metrics2.values[prefix + "tasks/active/task_running"]);
+  EXPECT_EQ(1, metrics2.values[prefix + "tasks/terminal/task_finished"]);
 }
 
 
@@ -8612,7 +9342,7 @@ class MasterTestPrePostReservationRefinement
   : public MasterTest,
     public WithParamInterface<bool> {
 public:
-  virtual master::Flags CreateMasterFlags()
+  master::Flags CreateMasterFlags() override
   {
     // Turn off periodic allocations to avoid the race between
     // `HierarchicalAllocator::updateAvailable()` and periodic allocations.
@@ -8856,13 +9586,13 @@ TEST_P(MasterTestPrePostReservationRefinement, LaunchGroup)
 
   AWAIT_READY(startingUpdate);
 
-  EXPECT_EQ(TASK_STARTING, startingUpdate->status().state());
+  EXPECT_EQ(v1::TASK_STARTING, startingUpdate->status().state());
   EXPECT_EQ(taskInfo.task_id(), startingUpdate->status().task_id());
   EXPECT_TRUE(startingUpdate->status().has_timestamp());
 
   AWAIT_READY(runningUpdate);
 
-  EXPECT_EQ(TASK_STARTING, runningUpdate->status().state());
+  EXPECT_EQ(v1::TASK_STARTING, runningUpdate->status().state());
   EXPECT_EQ(taskInfo.task_id(), runningUpdate->status().task_id());
   EXPECT_TRUE(runningUpdate->status().has_timestamp());
 
@@ -8961,7 +9691,9 @@ TEST_P(MasterTestPrePostReservationRefinement,
   // We use this to capture offers from 'resourceOffers'.
   Future<vector<Offer>> offers;
 
-  EXPECT_CALL(sched, registered(&driver, _, _));
+  FrameworkID frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(SaveArg<1>(&frameworkId));
 
   // The expectation for the first offer.
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -9078,6 +9810,23 @@ TEST_P(MasterTestPrePostReservationRefinement,
   EXPECT_TRUE(inboundResources(offer.resources())
                 .contains(allocatedResources(
                     unreservedCpus + unreservedDisk, frameworkInfo.roles(0))));
+
+  JSON::Object metrics = Metrics();
+
+  frameworkInfo.mutable_id()->CopyFrom(frameworkId);
+
+  const string prefix = master::getFrameworkMetricPrefix(frameworkInfo);
+
+  EXPECT_EQ(4, metrics.values[prefix + "calls"]);
+  EXPECT_EQ(4, metrics.values[prefix + "calls/accept"]);
+
+  EXPECT_EQ(4, metrics.values[prefix + "offers/accepted"]);
+
+  EXPECT_EQ(4, metrics.values[prefix + "operations"]);
+  EXPECT_EQ(1, metrics.values[prefix + "operations/reserve"]);
+  EXPECT_EQ(1, metrics.values[prefix + "operations/create"]);
+  EXPECT_EQ(1, metrics.values[prefix + "operations/destroy"]);
+  EXPECT_EQ(1, metrics.values[prefix + "operations/unreserve"]);
 
   driver.stop();
   driver.join();

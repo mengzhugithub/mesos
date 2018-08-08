@@ -78,6 +78,16 @@ string getRuntimePath(
 }
 
 
+string getContainerDevicesPath(
+    const string& runtimeDir,
+    const ContainerID& containerId)
+{
+  return path::join(
+      getRuntimePath(runtimeDir, containerId),
+      CONTAINER_DEVICES_DIRECTORY);
+}
+
+
 Result<pid_t> getContainerPid(
     const string& runtimeDir,
     const ContainerID& containerId)
@@ -94,7 +104,7 @@ Result<pid_t> getContainerPid(
     return None();
   }
 
-  Try<string> read = state::read<string>(path);
+  Result<string> read = state::read<string>(path);
   if (read.isError()) {
     return Error("Failed to recover pid of container: " + read.error());
   }
@@ -180,7 +190,7 @@ Result<pid_t> getContainerIOSwitchboardPid(
     return None();
   }
 
-  Try<string> read = state::read<string>(path);
+  Result<string> read = state::read<string>(path);
   if (read.isError()) {
     return Error("Failed to recover pid of io switchboard: " + read.error());
   }
@@ -206,6 +216,22 @@ string getContainerIOSwitchboardSocketPath(
 }
 
 
+string getContainerIOSwitchboardSocketProvisionalPath(
+    const std::string& socketPath)
+{
+  return socketPath + "_provisional";
+}
+
+
+string getContainerIOSwitchboardSocketProvisionalPath(
+    const std::string& runtimeDir,
+    const ContainerID& containerId)
+{
+  return getContainerIOSwitchboardSocketProvisionalPath(
+      getContainerIOSwitchboardSocketPath(runtimeDir, containerId));
+}
+
+
 Result<unix::Address> getContainerIOSwitchboardAddress(
     const string& runtimeDir,
     const ContainerID& containerId)
@@ -221,7 +247,7 @@ Result<unix::Address> getContainerIOSwitchboardAddress(
     return None();
   }
 
-  Try<string> read = state::read<string>(path);
+  Result<string> read = state::read<string>(path);
   if (read.isError()) {
     return Error("Failed reading '" + path + "': " + read.error());
   }
@@ -277,7 +303,7 @@ Result<ContainerTermination> getContainerTermination(
     return None();
   }
 
-  Try<ContainerTermination> termination =
+  Result<ContainerTermination> termination =
     state::read<ContainerTermination>(path);
 
   if (termination.isError()) {
@@ -325,7 +351,8 @@ Result<ContainerConfig> getContainerConfig(
     return None();
   }
 
-  Try<ContainerConfig> containerConfig = state::read<ContainerConfig>(path);
+  Result<ContainerConfig> containerConfig = state::read<ContainerConfig>(path);
+
   if (containerConfig.isError()) {
     return Error("Failed to read launch config of container: " +
                  containerConfig.error());
@@ -420,7 +447,7 @@ Result<ContainerLaunchInfo> getContainerLaunchInfo(
     return None();
   }
 
-  Try<ContainerLaunchInfo> containerLaunchInfo =
+  Result<ContainerLaunchInfo> containerLaunchInfo =
     state::read<ContainerLaunchInfo>(path);
 
   if (containerLaunchInfo.isError()) {

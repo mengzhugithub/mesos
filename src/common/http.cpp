@@ -32,6 +32,7 @@
 #include <mesos/quota/quota.hpp>
 
 #include <process/authenticator.hpp>
+#include <process/collect.hpp>
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
 #include <process/http.hpp>
@@ -154,7 +155,7 @@ static JSON::Value value(
 {
   switch (type) {
     case Value::SCALAR:
-      return resources.get<Value::Scalar>(name).get().value();
+      return resources.get<Value::Scalar>(name)->value();
     case Value::RANGES:
       return stringify(resources.get<Value::Ranges>(name).get());
     case Value::SET:
@@ -590,7 +591,7 @@ void json(JSON::ObjectWriter* writer, const ExecutorInfo& executorInfo)
   writer->field("name", executorInfo.name());
   writer->field("framework_id", executorInfo.framework_id().value());
   writer->field("command", executorInfo.command());
-  writer->field("resources", Resources(executorInfo.resources()));
+  writer->field("resources", executorInfo.resources());
 
   // Resources may be empty for command executors.
   if (!executorInfo.resources().empty()) {
@@ -652,14 +653,20 @@ static void json(JSON::ObjectWriter* writer, const NetworkInfo& info)
 }
 
 
-void json(JSON::ObjectWriter* writer, const Resources& resources)
+template <typename ResourceIterable>
+void json(
+    JSON::ObjectWriter* writer,
+    ResourceIterable begin,
+    ResourceIterable end)
 {
   hashmap<string, double> scalars =
     {{"cpus", 0}, {"gpus", 0}, {"mem", 0}, {"disk", 0}};
   hashmap<string, Value::Ranges> ranges;
   hashmap<string, Value::Set> sets;
 
-  foreach (const Resource& resource, resources) {
+  for (auto it = begin; it != end; ++it) {
+    const Resource& resource = *it;
+
     string name =
       resource.name() + (Resources::isRevocable(resource) ? "_revocable" : "");
     switch (resource.type()) {
@@ -672,14 +679,28 @@ void json(JSON::ObjectWriter* writer, const Resources& resources)
       case Value::SET:
         sets[name] += resource.set();
         break;
-      default:
-        LOG(FATAL) << "Unexpected Value type: " << resource.type();
+      case Value::TEXT:
+        break;
     }
   }
 
   json(writer, scalars);
   json(writer, ranges);
   json(writer, sets);
+}
+
+
+void json(JSON::ObjectWriter* writer, const Resources& resources)
+{
+  json(writer, resources.begin(), resources.end());
+}
+
+
+void json(
+    JSON::ObjectWriter* writer,
+    const google::protobuf::RepeatedPtrField<Resource>& resources)
+{
+  json(writer, resources.begin(), resources.end());
 }
 
 
@@ -691,7 +712,7 @@ void json(JSON::ObjectWriter* writer, const Task& task)
   writer->field("executor_id", task.executor_id().value());
   writer->field("slave_id", task.slave_id().value());
   writer->field("state", TaskState_Name(task.state()));
-  writer->field("resources", Resources(task.resources()));
+  writer->field("resources", task.resources());
 
   // Tasks are not allowed to mix resources allocated to
   // different roles, see MESOS-6636.
@@ -777,19 +798,19 @@ static void json(JSON::NumberWriter* writer, const Value::Scalar& scalar)
 
 static void json(JSON::StringWriter* writer, const Value::Ranges& ranges)
 {
-  writer->append(stringify(ranges));
+  writer->set(stringify(ranges));
 }
 
 
 static void json(JSON::StringWriter* writer, const Value::Set& set)
 {
-  writer->append(stringify(set));
+  writer->set(stringify(set));
 }
 
 
 static void json(JSON::StringWriter* writer, const Value::Text& text)
 {
-  writer->append(text.value());
+  writer->set(text.value());
 }
 
 namespace authorization {
@@ -861,82 +882,41 @@ const AuthorizationCallbacks createAuthorizationCallbacks(
   return callbacks;
 }
 
-
-bool approveViewFrameworkInfo(
-    const Owned<ObjectApprover>& frameworksApprover,
-    const FrameworkInfo& frameworkInfo)
+Future<Owned<ObjectApprovers>> ObjectApprovers::create(
+    const Option<Authorizer*>& authorizer,
+    const Option<Principal>& principal,
+    std::initializer_list<authorization::Action> actions)
 {
-  Try<bool> approved =
-    frameworksApprover->approved(ObjectApprover::Object(frameworkInfo));
-  if (approved.isError()) {
-    LOG(WARNING) << "Error during FrameworkInfo authorization: "
-                 << approved.error();
-    // TODO(joerg84): Consider exposing these errors to the caller.
-    return false;
+  // Ensures there are no repeated elements.
+  // Note: `set` is necessary because we relay in the order of the elements
+  // while doing `zip` below.
+  set<authorization::Action> _actions(actions);
+
+  Option<authorization::Subject> subject =
+    authorization::createSubject(principal);
+
+  if (authorizer.isNone()) {
+    hashmap<authorization::Action, Owned<ObjectApprover>> approvers;
+
+    foreach (authorization::Action action, _actions) {
+      approvers.put(
+          action,
+          Owned<ObjectApprover>(new AcceptingObjectApprover()));
+    }
+
+    return Owned<ObjectApprovers>(
+        new ObjectApprovers(std::move(approvers), principal));
   }
-  return approved.get();
-}
 
-
-bool approveViewExecutorInfo(
-    const Owned<ObjectApprover>& executorsApprover,
-    const ExecutorInfo& executorInfo,
-    const FrameworkInfo& frameworkInfo)
-{
-  Try<bool> approved = executorsApprover->approved(
-      ObjectApprover::Object(executorInfo, frameworkInfo));
-  if (approved.isError()) {
-    LOG(WARNING) << "Error during ExecutorInfo authorization: "
-                 << approved.error();
-    // TODO(joerg84): Consider exposing these errors to the caller.
-    return false;
-  }
-  return approved.get();
-}
-
-
-bool approveViewTaskInfo(
-    const Owned<ObjectApprover>& tasksApprover,
-    const TaskInfo& taskInfo,
-    const FrameworkInfo& frameworkInfo)
-{
-  Try<bool> approved =
-    tasksApprover->approved(ObjectApprover::Object(taskInfo, frameworkInfo));
-  if (approved.isError()) {
-    LOG(WARNING) << "Error during TaskInfo authorization: " << approved.error();
-    // TODO(joerg84): Consider exposing these errors to the caller.
-    return false;
-  }
-  return approved.get();
-}
-
-
-bool approveViewTask(
-    const Owned<ObjectApprover>& tasksApprover,
-    const Task& task,
-    const FrameworkInfo& frameworkInfo)
-{
-  Try<bool> approved =
-    tasksApprover->approved(ObjectApprover::Object(task, frameworkInfo));
-  if (approved.isError()) {
-    LOG(WARNING) << "Error during Task authorization: " << approved.error();
-    // TODO(joerg84): Consider exposing these errors to the caller.
-    return false;
-  }
-  return approved.get();
-}
-
-
-bool approveViewFlags(
-    const Owned<ObjectApprover>& flagsApprover)
-{
-  Try<bool> approved = flagsApprover->approved(ObjectApprover::Object());
-  if (approved.isError()) {
-    LOG(WARNING) << "Error during Flags authorization: " << approved.error();
-    // TODO(joerg84): Consider exposing these errors to the caller.
-    return false;
-  }
-  return approved.get();
+  return process::collect(lambda::map<vector>(
+      [&](authorization::Action action) -> Future<Owned<ObjectApprover>> {
+        return authorizer.get()->getObjectApprover(subject, action);
+      },
+      _actions))
+    .then([=](const vector<Owned<ObjectApprover>>& _approvers) {
+      return Owned<ObjectApprovers>(
+          new ObjectApprovers(lambda::zip(_actions, _approvers), principal));
+    });
 }
 
 
@@ -979,52 +959,6 @@ process::Future<bool> authorizeEndpoint(
             << " the '" << endpoint << "' endpoint";
 
   return authorizer.get()->authorized(request);
-}
-
-
-bool approveViewRole(
-    const Owned<ObjectApprover>& rolesApprover,
-    const string& role)
-{
-  Try<bool> approved = rolesApprover->approved(ObjectApprover::Object(role));
-  if (approved.isError()) {
-    LOG(WARNING) << "Error during Roles authorization: " << approved.error();
-    // TODO(joerg84): Consider exposing these errors to the caller.
-    return false;
-  }
-  return approved.get();
-}
-
-
-bool authorizeResource(
-    const Resource& resource,
-    const Option<Owned<AuthorizationAcceptor>>& acceptor)
-{
-  if (acceptor.isNone()) {
-    return true;
-  }
-
-  // Necessary because recovered agents are presented in old format.
-  if (resource.has_role() && resource.role() != "*" &&
-      !acceptor.get()->accept(resource.role())) {
-    return false;
-  }
-
-  if (resource.has_allocation_info() &&
-      !acceptor.get()->accept(resource.allocation_info().role())) {
-    return false;
-  }
-
-  // Reservations follow a path model where each entry is a child of the
-  // previous one. Therefore, to accept the resource the acceptor has to
-  // accept all entries.
-  foreach (Resource::ReservationInfo reservation, resource.reservations()) {
-    if (!acceptor.get()->accept(reservation.role())) {
-      return false;
-    }
-  }
-
-  return true;
 }
 
 
@@ -1193,28 +1127,5 @@ void logRequest(const process::http::Request& request)
                 ? " with X-Forwarded-For='" + forwardedFor.get() + "'"
                 : "");
 }
-
-
-Future<Owned<AuthorizationAcceptor>> AuthorizationAcceptor::create(
-    const Option<Principal>& principal,
-    const Option<Authorizer*>& authorizer,
-    const authorization::Action& action)
-{
-  if (authorizer.isNone()) {
-    return Owned<AuthorizationAcceptor>(
-        new AuthorizationAcceptor(Owned<ObjectApprover>(
-            new AcceptingObjectApprover())));
-  }
-
-  const Option<authorization::Subject> subject =
-    authorization::createSubject(principal);
-
-  return authorizer.get()->getObjectApprover(subject, action)
-    .then([=](const Owned<ObjectApprover>& approver) {
-      return Owned<AuthorizationAcceptor>(
-          new AuthorizationAcceptor(approver));
-    });
-}
-
 
 }  // namespace mesos {

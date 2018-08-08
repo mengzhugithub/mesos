@@ -792,8 +792,49 @@ TEST(ResourcesTest, Resources)
   EXPECT_SOME(r.cpus());
   EXPECT_DOUBLE_EQ(45.55, r.cpus().get());
   EXPECT_SOME_EQ(Megabytes(512), r.disk());
-  EXPECT_TRUE(r.mem().isNone());
-  EXPECT_TRUE(r.ports().isNone());
+  EXPECT_NONE(r.mem());
+  EXPECT_NONE(r.ports());
+}
+
+
+TEST(ResourcesTest, MoveConstruction)
+{
+  const Resources r = CHECK_NOTERROR(Resources::parse(
+      "cpus:45.55;mem:1024;ports:[10000-20000, 30000-50000];disk:512"));
+
+  // Move constructor for `Resources`.
+  Resources r1 = r;
+  Resources rr1{std::move(r)};
+  EXPECT_EQ(r, rr1);
+
+  // Move constructor for `vector<Resource>`.
+  vector<Resource> r2;
+  foreach (const Resource& resource, r) {
+    r2.push_back(resource);
+  }
+  Resources rr2{std::move(r2)};
+  EXPECT_EQ(r, rr2);
+
+  // Move constructor for `google::protobuf::RepeatedPtrField<Resource>`.
+  google::protobuf::RepeatedPtrField<Resource> r3;
+  foreach (const Resource& resource, r) {
+    *r3.Add() = resource;
+  }
+  Resources rr3{std::move(r3)};
+  EXPECT_EQ(r, rr3);
+
+  // Move assignment for `Resources`.
+  Resources r4 = r;
+  Resources rr4;
+  rr4 = std::move(r4);
+  EXPECT_EQ(r, rr4);
+
+  // Move constructor for `Resource`.
+  const Resource resource = CHECK_NOTERROR(Resources::parse("cpu", "1.0", "*"));
+
+  Resource r5 = resource;
+  Resources rr5{std::move(r5)};
+  EXPECT_EQ(Resources(resource), rr5);
 }
 
 
@@ -1078,9 +1119,10 @@ TEST(ResourcesTest, ScalarAddition)
   r1 += cpus1;
   r1 += mem1;
 
+  // Test +=(Resource&&).
   Resources r2;
-  r2 += cpus2;
-  r2 += mem2;
+  r2 += Resource(cpus2);
+  r2 += Resource(mem2);
 
   Resources sum = r1 + r2;
 
@@ -1088,6 +1130,15 @@ TEST(ResourcesTest, ScalarAddition)
   EXPECT_EQ(2u, sum.size());
   EXPECT_EQ(3, sum.get<Value::Scalar>("cpus")->value());
   EXPECT_EQ(15, sum.get<Value::Scalar>("mem")->value());
+
+  // Verify operator+ with rvalue references.
+  Resources sum1 = Resources(r1) + r2;
+  Resources sum2 = r1 + Resources(r2);
+  Resources sum3 = Resources(r1) + Resources(r2);
+
+  EXPECT_EQ(sum, sum1);
+  EXPECT_EQ(sum, sum2);
+  EXPECT_EQ(sum, sum3);
 
   Resources r = r1;
   r += r2;
@@ -1107,7 +1158,7 @@ TEST(ResourcesTest, ScalarAddition2)
 
   Resources r1;
   r1 += cpus1;
-  r1 += cpus2;
+  r1 += Resource(cpus2); // Test +=(Resource&&).
 
   Resources r2;
   r2 += cpus3;
@@ -1118,6 +1169,15 @@ TEST(ResourcesTest, ScalarAddition2)
   EXPECT_EQ(2u, sum.size());
   EXPECT_EQ(9, sum.cpus().get());
   EXPECT_EQ(sum, Resources::parse("cpus(role1):6;cpus(role2):3").get());
+
+  // Verify operator+ with rvalue references.
+  Resources sum1 = Resources(r1) + r2;
+  Resources sum2 = r1 + Resources(r2);
+  Resources sum3 = Resources(r1) + Resources(r2);
+
+  EXPECT_EQ(sum, sum1);
+  EXPECT_EQ(sum, sum2);
+  EXPECT_EQ(sum, sum3);
 }
 
 
@@ -1248,7 +1308,7 @@ TEST(ResourcesTest, RangesAddition)
 
   Resources r;
   r += ports1;
-  r += ports2;
+  r += Resource(ports2); // Test operator+=(Resource&&).
 
   EXPECT_FALSE(r.empty());
 
@@ -1265,7 +1325,7 @@ TEST(ResourcesTest, RangesAddition2)
 
   Resources r;
   r += ports1;
-  r += ports2;
+  r += Resource(ports2); // Test operator+=(Resource&&).
 
   EXPECT_FALSE(r.empty());
 
@@ -1284,7 +1344,7 @@ TEST(ResourcesTest, RangesAddition3)
 
   Resources r1;
   r1 += ports1;
-  r1 += ports2;
+  r1 += Resource(ports2); // Test operator+=(Resource&&).
 
   EXPECT_FALSE(r1.empty());
 
@@ -1294,7 +1354,7 @@ TEST(ResourcesTest, RangesAddition3)
 
   Resources r2;
   r2 += ports3;
-  r2 += ports4;
+  r2 += Resource(ports4); // Test operator+=(Resource&&).
 
   EXPECT_FALSE(r2.empty());
 
@@ -1322,7 +1382,7 @@ TEST(ResourcesTest, RangesAddition4)
 
   Resources r;
   r += ports1;
-  r += ports2;
+  r += Resource(ports2); // Test operator+=(Resource&&).
 
   EXPECT_FALSE(r.empty());
 
@@ -1498,7 +1558,7 @@ TEST(ResourcesTest, SetAddition)
 
   Resources r;
   r += disks1;
-  r += disks2;
+  r += Resource(disks2); // Test operator+=(Resource&&).
 
   EXPECT_FALSE(r.empty());
 
@@ -1612,7 +1672,7 @@ TEST(ResourceProviderIDTest, Addition)
 
   Resources r1;
   r1 += cpus;
-  r1 += disk2;
+  r1 += Resource(disk2); // Test operator+=(Resource&&).
 
   EXPECT_FALSE(r1.empty());
   EXPECT_EQ(2u, r1.size());
@@ -1624,7 +1684,7 @@ TEST(ResourceProviderIDTest, Addition)
 
   Resources r2;
   r2 += disk2;
-  r2 += disk2;
+  r2 += Resource(disk2); // Test operator+=(Resource&&).
 
   EXPECT_FALSE(r2.empty());
   EXPECT_EQ(1u, r2.size());
@@ -1635,7 +1695,7 @@ TEST(ResourceProviderIDTest, Addition)
 
   Resources r3;
   r3 += disk1;
-  r3 += disk2;
+  r3 += Resources(disk2); // Test operator+=(Resource&&).
 
   EXPECT_FALSE(r3.empty());
   EXPECT_EQ(2u, r3.size());
@@ -1927,16 +1987,50 @@ TEST(ResourcesTest, PrecisionRounding)
 }
 
 
-TEST(ResourcesTest, PrecisionVerySmallValue)
+TEST(ResourcesTest, VerySmallValue)
 {
-  Resources r1 = Resources::parse("cpus:2;mem:1024").get();
-  Resources r2 = Resources::parse("cpus:0.00001;mem:1").get();
+  Try<Resources> resources = Resources::parse("cpus:0.00001");
+  EXPECT_ERROR(resources);
+}
 
-  Resources r3 = r1 - (r1 - r2);
-  EXPECT_TRUE(r3.contains(r2));
 
-  Resources r4 = Resources::parse("cpus:0;mem:1").get();
-  EXPECT_EQ(r2, r4);
+TEST(ResourcesTest, AbsentResources)
+{
+  Try<Resources> resources = Resources::parse("gpus:0");
+  ASSERT_SOME(resources);
+
+  EXPECT_EQ(0u, resources->size());
+}
+
+
+TEST(ResourcesTest, isScalarQuantity)
+{
+  Resources scalarQuantity1 = Resources::parse("cpus:1").get();
+  EXPECT_TRUE(Resources::isScalarQuantity(scalarQuantity1));
+
+  Resources scalarQuantity2 = Resources::parse("cpus:1;mem:1").get();
+  EXPECT_TRUE(Resources::isScalarQuantity(scalarQuantity2));
+
+  Resources range = Resources::parse("ports", "[1-16000]", "*").get();
+  EXPECT_FALSE(Resources::isScalarQuantity(range));
+
+  Resources set = Resources::parse("names:{foo,bar}").get();
+  EXPECT_FALSE(Resources::isScalarQuantity(set));
+
+  Resources reserved = createReservedResource(
+      "cpus", "1", createDynamicReservationInfo("role", "principal"));
+  EXPECT_FALSE(Resources::isScalarQuantity(reserved));
+
+  Resources disk = createDiskResource("10", "role1", "1", "path");
+  EXPECT_FALSE(Resources::isScalarQuantity(disk));
+
+  Resources allocated = Resources::parse("cpus:1;mem:512").get();
+  allocated.allocate("role");
+  EXPECT_FALSE(Resources::isScalarQuantity(allocated));
+
+  Resource revocable = Resources::parse("cpus", "1", "*").get();
+  revocable.mutable_revocable();
+  EXPECT_FALSE(Resources::isScalarQuantity(revocable));
 }
 
 
@@ -2018,6 +2112,11 @@ TEST(ReservedResourcesTest, AdditionStaticallyReserved)
     createReservedResource("cpus", "12", createStaticReservationInfo("role"));
 
   EXPECT_EQ(expected, left + right);
+
+  // Test operator+ with rvalue references.
+  EXPECT_EQ(expected, Resources(left) + right);
+  EXPECT_EQ(expected, left + Resources(right));
+  EXPECT_EQ(expected, Resources(left) + Resources(right));
 }
 
 
@@ -2031,6 +2130,11 @@ TEST(ReservedResourcesTest, AdditionDynamicallyReservedWithoutLabels)
   Resources expected = createReservedResource("cpus", "12", reservation);
 
   EXPECT_EQ(expected, left + right);
+
+  // Test operator+ with rvalue references.
+  EXPECT_EQ(expected, left + Resources(right));
+  EXPECT_EQ(expected, Resources(left) + right);
+  EXPECT_EQ(expected, Resources(left) + Resources(right));
 }
 
 
@@ -2047,6 +2151,11 @@ TEST(ReservedResourcesTest, AdditionDynamicallyReservedWithSameLabels)
   Resources expected = createReservedResource("cpus", "12", reservation);
 
   EXPECT_EQ(expected, left + right);
+
+  // Test operator+ with rvalue references.
+  EXPECT_EQ(expected, left + Resources(right));
+  EXPECT_EQ(expected, Resources(left) + right);
+  EXPECT_EQ(expected, Resources(left) + Resources(right));
 }
 
 
@@ -2070,6 +2179,15 @@ TEST(ReservedResourcesTest, AdditionDynamicallyReservedWithDistinctLabels)
   EXPECT_EQ(2u, sum.size());
   EXPECT_FALSE(sum == r1 + r1);
   EXPECT_FALSE(sum == r2 + r2);
+
+  // Test operator+ with rvalue references.
+  Resources sum1 = Resources(r1) + r2;
+  Resources sum2 = r1 + Resources(r2);
+  Resources sum3 = Resources(r1) + Resources(r2);
+
+  EXPECT_EQ(sum, sum1);
+  EXPECT_EQ(sum, sum2);
+  EXPECT_EQ(sum, sum3);
 }
 
 
@@ -2368,6 +2486,15 @@ TEST(DiskResourcesTest, Addition)
   EXPECT_TRUE(sum.contains(r5));
   EXPECT_FALSE(sum.contains(r3));
   EXPECT_FALSE(sum.contains(r6));
+
+  // Test operator+ with rvalue references.
+  Resources sum1 = Resources(r4) + r5;
+  Resources sum2 = r4 + Resources(r5);
+  Resources sum3 = Resources(r4) + Resources(r5);
+
+  EXPECT_EQ(sum, sum1);
+  EXPECT_EQ(sum, sum2);
+  EXPECT_EQ(sum, sum3);
 }
 
 
@@ -2401,7 +2528,17 @@ TEST(DiskResourcesTest, DiskSourceAddition)
   EXPECT_FALSE(r8.contains(r5));
   EXPECT_TRUE(r8.contains(r8));
 
-  EXPECT_NE(r4, r1 + r5);
+  Resources sum = r1 + r5;
+  EXPECT_NE(r4, sum);
+
+  // Test operator+ with rvalue references.
+  Resources sum1 = Resources(r1) + r5;
+  Resources sum2 = r1 + Resources(r5);
+  Resources sum3 = Resources(r1) + Resources(r5);
+
+  EXPECT_EQ(sum, sum1);
+  EXPECT_EQ(sum, sum2);
+  EXPECT_EQ(sum, sum3);
 }
 
 
@@ -2603,19 +2740,14 @@ TEST(ResourcesOperationTest, StrippedResourcesVolume)
   Resources stripped = volume.createStrippedScalarQuantity();
 
   EXPECT_TRUE(stripped.persistentVolumes().empty());
+  EXPECT_TRUE(stripped.reserved().empty());
   EXPECT_EQ(Megabytes(200), stripped.disk().get());
-
-  // `createStrippedScalarQuantity` doesn't remove the `role` from a
-  // reserved resource.
-  EXPECT_FALSE(stripped.reserved("role").empty());
 
   Resource strippedVolume = *(stripped.begin());
 
   ASSERT_EQ(Value::SCALAR, strippedVolume.type());
   EXPECT_DOUBLE_EQ(200, strippedVolume.scalar().value());
-  EXPECT_EQ("role", Resources::reservationRole(strippedVolume));
   EXPECT_EQ("disk", strippedVolume.name());
-  EXPECT_EQ(1, strippedVolume.reservations_size());
   EXPECT_FALSE(strippedVolume.has_disk());
   EXPECT_FALSE(Resources::isPersistentVolume(strippedVolume));
 }
@@ -2644,13 +2776,11 @@ TEST(ResourcesOperationTest, StrippedResourcesReserved)
 
   Resources stripped = dynamicallyReserved.createStrippedScalarQuantity();
 
-  EXPECT_FALSE(stripped.reserved("role").empty());
+  EXPECT_TRUE(stripped.reserved("role").empty());
 
   foreach (const Resource& resource, stripped) {
-    EXPECT_EQ("role", Resources::reservationRole(resource));
-    EXPECT_FALSE(resource.reservations().empty());
     EXPECT_FALSE(Resources::isDynamicallyReserved(resource));
-    EXPECT_FALSE(Resources::isUnreserved(resource));
+    EXPECT_TRUE(Resources::isUnreserved(resource));
   }
 }
 
@@ -2677,6 +2807,19 @@ TEST(ResourcesOperationTest, StrippedResourcesNonScalar)
   Resources names = Resources::parse("names:{foo,bar}").get();
 
   EXPECT_TRUE(names.createStrippedScalarQuantity().empty());
+}
+
+
+TEST(ResourceOperationTest, StrippedResourcesRevocable)
+{
+  Resource plain = Resources::parse("cpus", "1", "*").get();
+
+  Resource revocable = plain;
+  revocable.mutable_revocable();
+
+  Resources stripped = Resources(revocable).createStrippedScalarQuantity();
+
+  EXPECT_EQ(Resources(plain), stripped);
 }
 
 
@@ -2829,6 +2972,15 @@ TEST(RevocableResourceTest, Addition)
   EXPECT_TRUE(sum.contains(r5));
   EXPECT_FALSE(sum.contains(r3));
   EXPECT_FALSE(sum.contains(r6));
+
+  // Test operator+ with rvalue references.
+  Resources sum1 = Resources(r4) + r5;
+  Resources sum2 = r4 + Resources(r5);
+  Resources sum3 = Resources(r4) + Resources(r5);
+
+  EXPECT_EQ(sum, sum1);
+  EXPECT_EQ(sum, sum2);
+  EXPECT_EQ(sum, sum3);
 }
 
 
@@ -2887,6 +3039,26 @@ TEST(RevocableResourceTest, Filter)
 
   EXPECT_EQ(r1, (r1 + r2).revocable());
   EXPECT_EQ(r2, (r1 + r2).nonRevocable());
+}
+
+
+// This test verifies that `Resources::find()` correctly distinguishes
+// between revocable and non-revocable resources.
+TEST(RevocableResourceTest, Find)
+{
+  Resources r1 = createRevocableResource("cpus", "1", "*", true);
+  EXPECT_EQ(r1, r1.revocable());
+  EXPECT_TRUE(r1.nonRevocable().empty());
+
+  Resources r2 = Resources::parse("cpus:1").get();
+  EXPECT_EQ(r2, r2.nonRevocable());
+  EXPECT_TRUE(r2.revocable().empty());
+
+  EXPECT_SOME_EQ(r1, (r1 + r2).find(r1));
+  EXPECT_SOME_EQ(r2, (r1 + r2).find(r2));
+
+  EXPECT_NONE(r1.find(r2));
+  EXPECT_NONE(r2.find(r1));
 }
 
 
@@ -3279,6 +3451,15 @@ TEST(SharedResourcesTest, ScalarAdditionShared)
   EXPECT_EQ(50, sum.get<Value::Scalar>("disk")->value());
   EXPECT_EQ(2u, sum.count(disk));
 
+  // Test operator+ with rvalue references.
+  Resources sum1 = Resources(r1) + r2;
+  Resources sum2 = r1 + Resources(r2);
+  Resources sum3 = Resources(r1) + Resources(r2);
+
+  EXPECT_EQ(sum, sum1);
+  EXPECT_EQ(sum, sum2);
+  EXPECT_EQ(sum, sum3);
+
   // Verify operator+= on Resources is the same as operator+.
   Resources r = r1;
   r += r2;
@@ -3475,7 +3656,7 @@ TEST(AllocatedResourcesTest, Addition)
   cpus2.allocate("role2");
 
   EXPECT_EQ(2u, (cpus1 + cpus2).size());
-  EXPECT_SOME_EQ(2.0, (cpus1 + cpus2).cpus());
+  EXPECT_SOME_EQ(2.0, (cpus1 + Resources(cpus2)).cpus());
 }
 
 
@@ -3584,24 +3765,6 @@ public:
     }
     reservations.totalOperations = 10;
 
-    // Test the performance of ranges using a fragmented range of
-    // ports: [1-2,4-5,7-8,...,1000]. Note that the benchmark will
-    // continuously sum together the same port range, which does
-    // not preserve arithmetic invariants (a+a-a != a).
-    string ports;
-    for (int portBegin = 1; portBegin < 1000-1; portBegin = portBegin + 3) {
-      if (!ports.empty()) {
-        ports += ",";
-      }
-      ports += stringify(portBegin) + "-" + stringify(portBegin+1);
-    }
-
-    // TODO(gyliu513): Move the ports resources benchmark test
-    // to a separate test class.
-    ScalarArithmeticParameter ranges;
-    ranges.resources = Resources::parse("ports:[" + ports + "]").get();
-    ranges.totalOperations = 1000;
-
     // Test a typical vector of scalars which include shared resources
     // (viz, shared persistent volumes).
     Resource disk = createDiskResource(
@@ -3613,7 +3776,6 @@ public:
 
     parameters_.push_back(std::move(scalars));
     parameters_.push_back(std::move(reservations));
-    parameters_.push_back(std::move(ranges));
     parameters_.push_back(std::move(shared));
 
     return parameters_;
@@ -3926,6 +4088,104 @@ TEST_P(Resources_Parse_BENCHMARK_Test, Parse)
     Try<Resources> resource = Resources::parse(inputString);
     EXPECT_SOME(resource);
   }
+}
+
+
+class Resources_Ranges_BENCHMARK_Test
+  : public MesosTest,
+    public ::testing::WithParamInterface<size_t> {};
+
+
+// Size "100" here means 100 sub-ranges. We choose to parameterize on number of
+// subranges because it's a dominant factor in the performance of range
+// arithmetic operations.
+INSTANTIATE_TEST_CASE_P(
+    ResourcesRangesSizes,
+    Resources_Ranges_BENCHMARK_Test,
+    ::testing::Values(10U, 100U, 1000U));
+
+
+// This test benchmarks the range arithmetic performance when the two
+// range operands have partial overlappings.
+TEST_P(Resources_Ranges_BENCHMARK_Test, ArithmeticOverlapping)
+{
+  const size_t totalOperations = 1000;
+
+  // We construct `ports1` and `ports2` such that each of their
+  // intervals partially overlaps with the other:
+  // ports1 = [1-6, 11-16, 21-26, ..., 991-996] (100 sub-ranges of [1-996])
+  // ports2 = [3-8, 13-18, 23-28, ..., 993-998] (100 sub-ranges of [1-998])
+  Value::Ranges ranges1, ranges2;
+  for (size_t i = 0, port1Index = 1, port2Index = 3, stride = 5; i < GetParam();
+       i++) {
+    *ranges1.add_range() = createRange(port1Index, port1Index + stride);
+    *ranges2.add_range() = createRange(port2Index, port2Index + stride);
+
+    port1Index += stride * 2;
+    port2Index += stride * 2;
+  }
+
+  Resources ports1 = createPorts(ranges1);
+  Resources ports2 = createPorts(ranges2);
+
+  auto printResult = [&](const string& operation, const Duration& elapsedTime) {
+    cout << "Took " << elapsedTime << " to perform " << totalOperations << " '"
+         << operation << "' operations on " << abbreviate(stringify(ports1), 27)
+         << ranges1.range(GetParam() - 1).begin() << "-"
+         << ranges1.range(GetParam() - 1).end() << "] and "
+         << abbreviate(stringify(ports2), 27) << ", "
+         << ranges2.range(GetParam() - 1).begin() << "-"
+         << ranges2.range(GetParam() - 1).end() << "] with " << GetParam()
+         << " sub-ranges" << endl;
+  };
+
+  Resources result;
+
+  Stopwatch watch;
+
+  Duration elapsedTime;
+
+  for (size_t i = 0; i < totalOperations; i++) {
+    result = ports1;
+
+    watch.start();
+    result += ports2;
+    watch.stop();
+
+    elapsedTime += watch.elapsed();
+  }
+
+  printResult("a += b", elapsedTime);
+
+  elapsedTime = Duration::zero();
+
+  for (size_t i = 0; i < totalOperations; i++) {
+    result = ports1;
+
+    watch.start();
+    result -= ports2;
+    watch.stop();
+
+    elapsedTime += watch.elapsed();
+  }
+
+  printResult("a -= b", elapsedTime);
+
+  watch.start();
+  for (size_t i = 0; i < totalOperations; i++) {
+    result = ports1 + ports2;
+  }
+  watch.stop();
+
+  printResult("a + b", watch.elapsed());
+
+  watch.start();
+  for (size_t i = 0; i < totalOperations; i++) {
+    result = ports1 - ports2;
+  }
+  watch.stop();
+
+  printResult("a - b", watch.elapsed());
 }
 
 } // namespace tests {

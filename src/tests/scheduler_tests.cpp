@@ -1010,6 +1010,189 @@ TEST_P(SchedulerTest, KillTask)
 }
 
 
+// Verifies invalidation of LAUNCH and LAUNCH_GROUP operations with `id` set.
+TEST_P(SchedulerTest, OperationFeedbackValidationWithResourceProviderCapability)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  Future<Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  ContentType contentType = GetParam();
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      contentType,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  Future<v1::scheduler::Event::Update> taskStatusUpdate1;
+  Future<v1::scheduler::Event::Update> taskStatusUpdate2;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&taskStatusUpdate1))
+    .WillOnce(FutureArg<1>(&taskStatusUpdate2));
+
+  // LAUNCH and LAUNCH_GROUP operations should not have the `id` field set.
+  v1::Resources resources =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  v1::TaskInfo taskInfo1 =
+    v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
+
+  v1::Offer::Operation launch = v1::LAUNCH({taskInfo1});
+  launch.mutable_id()->set_value("LAUNCH_OPERATION");
+
+  v1::TaskInfo taskInfo2 = taskInfo1;
+  taskInfo2.mutable_task_id()->set_value("TASK_ID_2");
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  v1::Offer::Operation launchGroup = v1::LAUNCH_GROUP(
+      executorInfo, v1::createTaskGroupInfo({taskInfo2}));
+  launchGroup.mutable_id()->set_value("LAUNCH_GROUP_OPERATION");
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {launch, launchGroup}));
+
+  AWAIT_READY(taskStatusUpdate1);
+  AWAIT_READY(taskStatusUpdate2);
+
+  EXPECT_EQ(v1::TASK_ERROR, taskStatusUpdate1->status().state());
+  EXPECT_EQ(v1::TASK_ERROR, taskStatusUpdate2->status().state());
+}
+
+
+// Verifies invalidation of RESERVE operations with `id` set, acting upon an
+// offer from an agent without the RESOURCE_PROVIDER capability.
+TEST_P(SchedulerTest, OperationFeedbackValidationNoResourceProviderCapability)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  slaveFlags.agent_features = SlaveCapabilities();
+
+  foreach (
+      const SlaveInfo::Capability& slaveCapability,
+      slave::AGENT_CAPABILITIES()) {
+    if (slaveCapability.type() != SlaveInfo::Capability::RESOURCE_PROVIDER) {
+      slaveFlags.agent_features->add_capabilities()->CopyFrom(slaveCapability);
+    }
+  }
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.add_roles("framework-role");
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  Future<Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  ContentType contentType = GetParam();
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      contentType,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  Future<v1::scheduler::Event::UpdateOperationStatus> updateOperationStatus;
+  EXPECT_CALL(*scheduler, updateOperationStatus(_, _))
+    .WillOnce(FutureArg<1>(&updateOperationStatus));
+
+  // RESERVE operations should not have the `id` field set when acting upon
+  // resources from an agent without the RESOURCE_PROVIDER capability.
+  const v1::Offer& offer = offers->offers(0);
+
+  v1::Resources resources = v1::Resources::parse("cpus:0.1").get();
+  resources.pushReservation(v1::createDynamicReservationInfo(
+      frameworkInfo.roles(1),
+      frameworkInfo.principal()));
+
+  v1::Offer::Operation operation = v1::RESERVE(resources);
+  operation.mutable_id()->set_value("RESERVE_OPERATION");
+
+  mesos.send(v1::createCallAccept(frameworkId, offer, {operation}));
+
+  AWAIT_READY(updateOperationStatus);
+
+  EXPECT_EQ(
+      mesos::v1::OPERATION_ERROR,
+      updateOperationStatus->status().state());
+}
+
+
 TEST_P(SchedulerTest, ShutdownExecutor)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
@@ -1332,6 +1515,8 @@ TEST_P(SchedulerTest, Revive)
 
 TEST_P(SchedulerTest, Suppress)
 {
+  const string ROLE = "foo";
+
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
@@ -1365,12 +1550,17 @@ TEST_P(SchedulerTest, Suppress)
   EXPECT_CALL(*scheduler, offers(_, _))
     .WillOnce(FutureArg<1>(&offers1));
 
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+
+  frameworkInfo.clear_roles();
+  frameworkInfo.add_roles(ROLE);
+
   {
     Call call;
     call.set_type(Call::SUBSCRIBE);
 
     Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
+    subscribe->mutable_framework_info()->CopyFrom(frameworkInfo);
 
     mesos.send(call);
   }
@@ -1378,6 +1568,8 @@ TEST_P(SchedulerTest, Suppress)
   AWAIT_READY(subscribed);
 
   v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  frameworkInfo.mutable_id()->CopyFrom(frameworkId);
 
   AWAIT_READY(offers1);
   ASSERT_FALSE(offers1->offers().empty());
@@ -1404,6 +1596,20 @@ TEST_P(SchedulerTest, Suppress)
     mesos.send(call);
   }
 
+  // Wait for the master to process the DECLINE call.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
+
+  JSON::Object metrics1 = Metrics();
+
+  const string prefix =
+    master::getFrameworkMetricPrefix(devolve(frameworkInfo));
+
+  EXPECT_EQ(1, metrics1.values[prefix + "subscribed"]);
+  EXPECT_EQ(1, metrics1.values[prefix + "offers/declined"]);
+  EXPECT_EQ(0, metrics1.values[prefix + "roles/" + ROLE + "/suppressed"]);
+
   Future<Nothing> suppressOffers =
     FUTURE_DISPATCH(_, &MesosAllocatorProcess::suppressOffers);
 
@@ -1420,6 +1626,10 @@ TEST_P(SchedulerTest, Suppress)
   // Wait for allocator to finish executing 'suppressOffers()'.
   Clock::pause();
   Clock::settle();
+
+  JSON::Object metrics2 = Metrics();
+
+  EXPECT_EQ(1, metrics2.values[prefix + "roles/" + ROLE + "/suppressed"]);
 
   // No offers should be sent within 100 mins because the framework
   // suppressed offers.
@@ -2080,7 +2290,7 @@ class SchedulerSSLTest
 // These test setup/teardown methods are only needed when compiled with SSL.
 #ifdef USE_SSL_SOCKET
 protected:
-  virtual void SetUp()
+  void SetUp() override
   {
     MesosTest::SetUp();
 

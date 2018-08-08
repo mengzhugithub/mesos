@@ -23,15 +23,18 @@ target_link_libraries(
   stout INTERFACE
   apr
   boost
-  libcurl
   elfio
   glog
+  libarchive
+  libcurl
   picojson
   protobuf
+  rapidjson
   Threads::Threads
   zlib
   $<$<PLATFORM_ID:Linux>:rt dl svn>
   $<$<PLATFORM_ID:Darwin>:svn>
-  $<$<PLATFORM_ID:Windows>:Ws2_32 IPHlpAPI Mswsock Secur32 Userenv>)
+  $<$<PLATFORM_ID:Windows>:Ws2_32 IPHlpAPI Mswsock Secur32 Userenv>
+  $<$<PLATFORM_ID:FreeBSD>:svn>)
 
 add_subdirectory(tests)

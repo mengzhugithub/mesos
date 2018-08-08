@@ -14,7 +14,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <list>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -62,6 +61,7 @@
 #include "common/http.hpp"
 #include "common/recordio.hpp"
 #include "common/resources_utils.hpp"
+#include "common/validation.hpp"
 
 #include "internal/devolve.hpp"
 
@@ -80,6 +80,28 @@
 using mesos::agent::ProcessIO;
 
 using mesos::authorization::createSubject;
+using mesos::authorization::VIEW_CONTAINER;
+using mesos::authorization::VIEW_FLAGS;
+using mesos::authorization::VIEW_FRAMEWORK;
+using mesos::authorization::VIEW_TASK;
+using mesos::authorization::VIEW_EXECUTOR;
+using mesos::authorization::VIEW_RESOURCE_PROVIDER;
+using mesos::authorization::VIEW_ROLE;
+using mesos::authorization::SET_LOG_LEVEL;
+using mesos::authorization::ATTACH_CONTAINER_INPUT;
+using mesos::authorization::ATTACH_CONTAINER_OUTPUT;
+using mesos::authorization::LAUNCH_NESTED_CONTAINER;
+using mesos::authorization::LAUNCH_NESTED_CONTAINER_SESSION;
+using mesos::authorization::LAUNCH_STANDALONE_CONTAINER;
+using mesos::authorization::WAIT_NESTED_CONTAINER;
+using mesos::authorization::WAIT_STANDALONE_CONTAINER;
+using mesos::authorization::VIEW_STANDALONE_CONTAINER;
+using mesos::authorization::KILL_NESTED_CONTAINER;
+using mesos::authorization::KILL_STANDALONE_CONTAINER;
+using mesos::authorization::REMOVE_NESTED_CONTAINER;
+using mesos::authorization::REMOVE_STANDALONE_CONTAINER;
+using mesos::authorization::MODIFY_RESOURCE_PROVIDER_CONFIG;
+using mesos::authorization::PRUNE_IMAGES;
 
 using mesos::internal::recordio::Reader;
 
@@ -138,7 +160,7 @@ static void json(JSON::ObjectWriter* writer, const TaskInfo& task)
   writer->field("id", task.task_id().value());
   writer->field("name", task.name());
   writer->field("slave_id", task.slave_id().value());
-  writer->field("resources", Resources(task.resources()));
+  writer->field("resources", task.resources());
 
   // Tasks are not allowed to mix resources allocated to
   // different roles, see MESOS-6636.
@@ -159,7 +181,7 @@ static void json(
     JSON::StringWriter* writer,
     const SlaveInfo::Capability& capability)
 {
-  writer->append(SlaveInfo::Capability::Type_Name(capability.type()));
+  writer->set(SlaveInfo::Capability::Type_Name(capability.type()));
 }
 
 namespace internal {
@@ -175,10 +197,10 @@ using process::http::Request;
 struct ExecutorWriter
 {
   ExecutorWriter(
-      const Owned<ObjectApprover>& taskApprover,
+      const Owned<ObjectApprovers>& approvers,
       const Executor* executor,
       const Framework* framework)
-    : taskApprover_(taskApprover),
+    : approvers_(approvers),
       executor_(executor),
       framework_(framework) {}
 
@@ -210,7 +232,7 @@ struct ExecutorWriter
 
     writer->field("tasks", [this](JSON::ArrayWriter* writer) {
       foreachvalue (Task* task, executor_->launchedTasks) {
-        if (!approveViewTask(taskApprover_, *task, framework_->info)) {
+        if (!approvers_->approved<VIEW_TASK>(*task, framework_->info)) {
           continue;
         }
 
@@ -220,7 +242,7 @@ struct ExecutorWriter
 
     writer->field("queued_tasks", [this](JSON::ArrayWriter* writer) {
       foreachvalue (const TaskInfo& task, executor_->queuedTasks) {
-        if (!approveViewTaskInfo(taskApprover_, task, framework_->info)) {
+        if (!approvers_->approved<VIEW_TASK>(task, framework_->info)) {
           continue;
         }
 
@@ -230,7 +252,7 @@ struct ExecutorWriter
 
     writer->field("completed_tasks", [this](JSON::ArrayWriter* writer) {
       foreach (const std::shared_ptr<Task>& task, executor_->completedTasks) {
-        if (!approveViewTask(taskApprover_, *task, framework_->info)) {
+        if (!approvers_->approved<VIEW_TASK>(*task, framework_->info)) {
           continue;
         }
 
@@ -240,7 +262,7 @@ struct ExecutorWriter
       // NOTE: We add 'terminatedTasks' to 'completed_tasks' for
       // simplicity.
       foreachvalue (Task* task, executor_->terminatedTasks) {
-        if (!approveViewTask(taskApprover_, *task, framework_->info)) {
+        if (!approvers_->approved<VIEW_TASK>(*task, framework_->info)) {
           continue;
         }
 
@@ -249,7 +271,7 @@ struct ExecutorWriter
     });
   }
 
-  const Owned<ObjectApprover>& taskApprover_;
+  const Owned<ObjectApprovers>& approvers_;
   const Executor* executor_;
   const Framework* framework_;
 };
@@ -260,11 +282,9 @@ struct ExecutorWriter
 struct FrameworkWriter
 {
   FrameworkWriter(
-      const Owned<ObjectApprover>& taskApprover,
-      const Owned<ObjectApprover>& executorApprover,
+      const Owned<ObjectApprovers>& approvers,
       const Framework* framework)
-    : taskApprover_(taskApprover),
-      executorApprover_(executorApprover),
+    : approvers_(approvers),
       framework_(framework) {}
 
   void operator()(JSON::ObjectWriter* writer) const
@@ -293,13 +313,13 @@ struct FrameworkWriter
 
     writer->field("executors", [this](JSON::ArrayWriter* writer) {
       foreachvalue (Executor* executor, framework_->executors) {
-        if (!approveViewExecutorInfo(
-                executorApprover_, executor->info, framework_->info)) {
+        if (!approvers_->approved<VIEW_EXECUTOR>(
+                executor->info, framework_->info)) {
           continue;
         }
 
         ExecutorWriter executorWriter(
-            taskApprover_,
+            approvers_,
             executor,
             framework_);
 
@@ -311,13 +331,13 @@ struct FrameworkWriter
         "completed_executors", [this](JSON::ArrayWriter* writer) {
           foreach (
               const Owned<Executor>& executor, framework_->completedExecutors) {
-            if (!approveViewExecutorInfo(
-                executorApprover_, executor->info, framework_->info)) {
+            if (!approvers_->approved<VIEW_EXECUTOR>(
+                    executor->info, framework_->info)) {
               continue;
             }
 
             ExecutorWriter executorWriter(
-                taskApprover_,
+                approvers_,
                 executor.get(),
                 framework_);
 
@@ -326,8 +346,7 @@ struct FrameworkWriter
         });
   }
 
-  const Owned<ObjectApprover>& taskApprover_;
-  const Owned<ObjectApprover>& executorApprover_;
+  const Owned<ObjectApprovers>& approvers_;
   const Framework* framework_;
 };
 
@@ -449,6 +468,8 @@ Future<Response> Http::api(
 
   Option<ContentType> messageAcceptType;
   if (streamingMediaType(acceptType)) {
+    // Note that `acceptsMediaType()` returns true if the given headers
+    // field does not exist, i.e. by default we return JSON here.
     if (request.acceptsMediaType(MESSAGE_ACCEPT, APPLICATION_JSON)) {
       messageAcceptType = ContentType::JSON;
     } else if (request.acceptsMediaType(MESSAGE_ACCEPT, APPLICATION_PROTOBUF)) {
@@ -524,13 +545,20 @@ Future<Response> Http::_api(
   if (streamingMediaType(mediaTypes.content) &&
       call.type() != mesos::agent::Call::ATTACH_CONTAINER_INPUT) {
     return UnsupportedMediaType(
-        "Streaming 'Content-Type' " + stringify(mediaTypes.content) + " is not "
-        "supported for " + stringify(call.type()) + " call");
+        "Streaming 'Content-Type' " + stringify(mediaTypes.content) + " is "
+        "not supported for " + stringify(call.type()) + " call");
   } else if (!streamingMediaType(mediaTypes.content) &&
              call.type() == mesos::agent::Call::ATTACH_CONTAINER_INPUT) {
     return UnsupportedMediaType(
         string("Expecting 'Content-Type' to be ") + APPLICATION_RECORDIO +
         " for " + stringify(call.type()) + " call");
+  }
+
+  if (streamingMediaType(mediaTypes.accept) &&
+      call.type() != mesos::agent::Call::ATTACH_CONTAINER_OUTPUT &&
+      call.type() != mesos::agent::Call::LAUNCH_NESTED_CONTAINER_SESSION) {
+    return NotAcceptable("Streaming response is not supported for " +
+        stringify(call.type()) + " call");
   }
 
   // Each handler must log separately to add context
@@ -574,6 +602,9 @@ Future<Response> Http::_api(
 
     case mesos::agent::Call::GET_EXECUTORS:
       return getExecutors(call, mediaTypes.accept, principal);
+
+    case mesos::agent::Call::GET_OPERATIONS:
+      return getOperations(call, mediaTypes.accept, principal);
 
     case mesos::agent::Call::GET_TASKS:
       return getTasks(call, mediaTypes.accept, principal);
@@ -738,7 +769,7 @@ Future<Response> Http::executor(
 
   const executor::Call call = devolve(v1Call);
 
-  Option<Error> error = validation::executor::call::validate(call);
+  Option<Error> error = common::validation::validateExecutorCall(call);
 
   if (error.isSome()) {
     return BadRequest("Failed to validate Executor::Call: " + error->message);
@@ -933,33 +964,20 @@ Future<Response> Http::getFlags(
 
   LOG(INFO) << "Processing GET_FLAGS call";
 
-  Future<Owned<ObjectApprover>> approver;
+  return ObjectApprovers::create(slave->authorizer, principal, {VIEW_FLAGS})
+    .then(defer(
+        slave->self(),
+        [this, acceptType](
+            const Owned<ObjectApprovers>& approvers) -> Response {
+          if (!approvers->approved<VIEW_FLAGS>()) {
+            return Forbidden();
+          }
 
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
-
-    approver = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_FLAGS);
-  } else {
-    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return approver.then(defer(slave->self(),
-      [this, acceptType](
-          const Owned<ObjectApprover>& approver) -> Future<Response> {
-        Try<bool> approved = approver->approved(ObjectApprover::Object());
-
-        if (approved.isError()) {
-          return InternalServerError(approved.error());
-        } else if (!approved.get()) {
-          return Forbidden();
-        }
-
-        return OK(
-            serialize(
-                acceptType, evolve<v1::agent::Response::GET_FLAGS>(_flags())),
-            stringify(acceptType));
-      }));
+          return OK(
+              serialize(
+                  acceptType, evolve<v1::agent::Response::GET_FLAGS>(_flags())),
+              stringify(acceptType));
+        }));
 }
 
 
@@ -1030,7 +1048,7 @@ Future<Response> Http::getMetrics(
   }
 
   return process::metrics::snapshot(timeout)
-      .then([acceptType](const hashmap<string, double>& metrics) -> Response {
+      .then([acceptType](const map<string, double>& metrics) -> Response {
           mesos::agent::Response response;
         response.set_type(mesos::agent::Response::GET_METRICS);
         mesos::agent::Response::GetMetrics* _getMetrics =
@@ -1080,34 +1098,18 @@ Future<Response> Http::setLoggingLevel(
 
   LOG(INFO) << "Processing SET_LOGGING_LEVEL call for level " << level;
 
-  Future<Owned<ObjectApprover>> approver;
+  return ObjectApprovers::create(slave->authorizer, principal, {SET_LOG_LEVEL})
+    .then([level, duration](
+        const Owned<ObjectApprovers>& approvers) -> Future<Response> {
+      if (!approvers->approved<SET_LOG_LEVEL>()) {
+        return Forbidden();
+      }
 
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
-
-    approver = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::SET_LOG_LEVEL);
-  } else {
-    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return approver.then(
-      [level, duration](
-          const Owned<ObjectApprover>& approver) -> Future<Response> {
-        Try<bool> approved = approver->approved((ObjectApprover::Object()));
-
-        if (approved.isError()) {
-          return InternalServerError(approved.error());
-        } else if (!approved.get()) {
-          return Forbidden();
-        }
-
-        return dispatch(
-            process::logging(), &Logging::set_level, level, duration)
-          .then([]() -> Response {
-            return OK();
-          });
-      });
+      return dispatch(process::logging(), &Logging::set_level, level, duration)
+        .then([]() -> Response {
+          return OK();
+        });
+    });
 }
 
 
@@ -1226,7 +1228,6 @@ string Http::STATE_HELP() {
         "         \"docker_kill_orphans\" : \"true\",",
         "         \"switch_user\" : \"true\",",
         "         \"logging_level\" : \"INFO\",",
-        "         \"hadoop_home\" : \"\",",
         "         \"strict\" : \"true\",",
         "         \"executor_registration_timeout\" : \"1mins\",",
         "         \"recovery_timeout\" : \"15mins\",",
@@ -1271,238 +1272,179 @@ Future<Response> Http::state(
     return ServiceUnavailable("Agent has not finished recovery");
   }
 
-  // Retrieve `ObjectApprover`s for authorizing frameworks and tasks.
-  Future<Owned<ObjectApprover>> frameworksApprover;
-  Future<Owned<ObjectApprover>> tasksApprover;
-  Future<Owned<ObjectApprover>> executorsApprover;
-  Future<Owned<ObjectApprover>> flagsApprover;
-  Future<Owned<ObjectApprover>> rolesApprover;
-
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
-
-    frameworksApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_FRAMEWORK);
-
-    tasksApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_TASK);
-
-    executorsApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_EXECUTOR);
-
-    flagsApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_FLAGS);
-
-    rolesApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_ROLE);
-  } else {
-    frameworksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    tasksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    executorsApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    flagsApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    rolesApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return collect(
-      frameworksApprover,
-      tasksApprover,
-      executorsApprover,
-      flagsApprover,
-      rolesApprover)
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {VIEW_FRAMEWORK, VIEW_TASK, VIEW_EXECUTOR, VIEW_FLAGS, VIEW_ROLE})
     .then(defer(
         slave->self(),
-        [this, request](const tuple<Owned<ObjectApprover>,
-                                    Owned<ObjectApprover>,
-                                    Owned<ObjectApprover>,
-                                    Owned<ObjectApprover>,
-                                    Owned<ObjectApprover>>& approvers)
-          -> Response {
-      // This lambda is consumed before the outer lambda
-      // returns, hence capture by reference is fine here.
-      auto state = [this, &approvers](JSON::ObjectWriter* writer) {
-        // Get approver from tuple.
-        Owned<ObjectApprover> frameworksApprover;
-        Owned<ObjectApprover> tasksApprover;
-        Owned<ObjectApprover> executorsApprover;
-        Owned<ObjectApprover> flagsApprover;
-        Owned<ObjectApprover> rolesApprover;
-        tie(frameworksApprover,
-            tasksApprover,
-            executorsApprover,
-            flagsApprover,
-            rolesApprover) = approvers;
+        [this, request](const Owned<ObjectApprovers>& approvers) -> Response {
+          // This lambda is consumed before the outer lambda
+          // returns, hence capture by reference is fine here.
+          auto state = [this, &approvers](JSON::ObjectWriter* writer) {
+            writer->field("version", MESOS_VERSION);
 
-        writer->field("version", MESOS_VERSION);
+            if (build::GIT_SHA.isSome()) {
+              writer->field("git_sha", build::GIT_SHA.get());
+            }
 
-        if (build::GIT_SHA.isSome()) {
-          writer->field("git_sha", build::GIT_SHA.get());
-        }
+            if (build::GIT_BRANCH.isSome()) {
+              writer->field("git_branch", build::GIT_BRANCH.get());
+            }
 
-        if (build::GIT_BRANCH.isSome()) {
-          writer->field("git_branch", build::GIT_BRANCH.get());
-        }
+            if (build::GIT_TAG.isSome()) {
+              writer->field("git_tag", build::GIT_TAG.get());
+            }
 
-        if (build::GIT_TAG.isSome()) {
-          writer->field("git_tag", build::GIT_TAG.get());
-        }
+            writer->field("build_date", build::DATE);
+            writer->field("build_time", build::TIME);
+            writer->field("build_user", build::USER);
+            writer->field("start_time", slave->startTime.secs());
 
-        writer->field("build_date", build::DATE);
-        writer->field("build_time", build::TIME);
-        writer->field("build_user", build::USER);
-        writer->field("start_time", slave->startTime.secs());
-
-        writer->field("id", slave->info.id().value());
-        writer->field("pid", string(slave->self()));
-        writer->field("hostname", slave->info.hostname());
-        writer->field("capabilities", slave->capabilities.toRepeatedPtrField());
-
-        if (slave->info.has_domain()) {
-          writer->field("domain", slave->info.domain());
-        }
-
-        const Resources& totalResources = slave->totalResources;
-
-        writer->field("resources", totalResources);
-        writer->field(
-            "reserved_resources",
-            [&totalResources, &rolesApprover](JSON::ObjectWriter* writer) {
-              foreachpair (const string& role,
-                           const Resources& resources,
-                           totalResources.reservations()) {
-                if (approveViewRole(rolesApprover, role)) {
-                  writer->field(role, resources);
-                }
-              }
-            });
-
-        writer->field("unreserved_resources", totalResources.unreserved());
-
-        writer->field(
-            "reserved_resources_full",
-            [&totalResources, &rolesApprover](JSON::ObjectWriter* writer) {
-              foreachpair (const string& role,
-                           const Resources& resources,
-                           totalResources.reservations()) {
-                if (approveViewRole(rolesApprover, role)) {
-                  writer->field(role, [&resources](JSON::ArrayWriter* writer) {
-                    foreach (Resource resource, resources) {
-                      convertResourceFormat(&resource, ENDPOINT);
-                      writer->element(JSON::Protobuf(resource));
-                    }
-                  });
-                }
-              }
-            });
-
-        writer->field(
-            "unreserved_resources_full",
-            [&totalResources](JSON::ArrayWriter* writer) {
-              foreach (Resource resource, totalResources.unreserved()) {
-                convertResourceFormat(&resource, ENDPOINT);
-                writer->element(JSON::Protobuf(resource));
-              }
-            });
-
-        // TODO(abudnik): Consider storing the allocatedResources in the Slave
-        // struct rather than computing it here each time.
-        Resources allocatedResources;
-
-        foreachvalue (const Framework* framework, slave->frameworks) {
-          allocatedResources += framework->allocatedResources();
-        }
-
-        writer->field(
-            "reserved_resources_allocated",
-            [&allocatedResources, &rolesApprover](JSON::ObjectWriter* writer) {
-              foreachpair (const string& role,
-                           const Resources& resources,
-                           allocatedResources.reservations()) {
-                if (approveViewRole(rolesApprover, role)) {
-                  writer->field(role, resources);
-                }
-              }
-            });
-
-        writer->field(
-            "unreserved_resources_allocated", allocatedResources.unreserved());
-
-        writer->field("attributes", Attributes(slave->info.attributes()));
-
-        if (slave->master.isSome()) {
-          Try<string> hostname =
-            net::getHostname(slave->master->address.ip);
-
-          if (hostname.isSome()) {
-            writer->field("master_hostname", hostname.get());
-          }
-        }
-
-        if (approveViewFlags(flagsApprover)) {
-          if (slave->flags.log_dir.isSome()) {
-            writer->field("log_dir", slave->flags.log_dir.get());
-          }
-
-          if (slave->flags.external_log_file.isSome()) {
+            writer->field("id", slave->info.id().value());
+            writer->field("pid", string(slave->self()));
+            writer->field("hostname", slave->info.hostname());
             writer->field(
-                "external_log_file", slave->flags.external_log_file.get());
-          }
+                "capabilities",
+                slave->capabilities.toRepeatedPtrField());
 
-          writer->field("flags", [this](JSON::ObjectWriter* writer) {
-            foreachvalue (const flags::Flag& flag, slave->flags) {
-              Option<string> value = flag.stringify(slave->flags);
-              if (value.isSome()) {
-                writer->field(flag.effective_name().value, value.get());
+            if (slave->info.has_domain()) {
+              writer->field("domain", slave->info.domain());
+            }
+
+            const Resources& totalResources = slave->totalResources;
+
+            writer->field("resources", totalResources);
+            writer->field(
+                "reserved_resources",
+                [&totalResources, &approvers](JSON::ObjectWriter* writer) {
+                  foreachpair (const string& role,
+                               const Resources& resources,
+                               totalResources.reservations()) {
+                    if (approvers->approved<VIEW_ROLE>(role)) {
+                      writer->field(role, resources);
+                    }
+                  }
+                });
+
+            writer->field("unreserved_resources", totalResources.unreserved());
+
+            writer->field(
+                "reserved_resources_full",
+                [&totalResources, &approvers](JSON::ObjectWriter* writer) {
+                  foreachpair (const string& role,
+                               const Resources& resources,
+                               totalResources.reservations()) {
+                    if (approvers->approved<VIEW_ROLE>(role)) {
+                      writer->field(
+                          role,
+                          [&resources](JSON::ArrayWriter* writer) {
+                            foreach (Resource resource, resources) {
+                              convertResourceFormat(&resource, ENDPOINT);
+                              writer->element(JSON::Protobuf(resource));
+                            }
+                          });
+                    }
+                  }
+                });
+
+            writer->field(
+                "unreserved_resources_full",
+                [&totalResources](JSON::ArrayWriter* writer) {
+                  foreach (Resource resource, totalResources.unreserved()) {
+                    convertResourceFormat(&resource, ENDPOINT);
+                    writer->element(JSON::Protobuf(resource));
+                  }
+                });
+
+            // TODO(abudnik): Consider storing the allocatedResources in the
+            // Slave struct rather than computing it here each time.
+            Resources allocatedResources;
+
+            foreachvalue (const Framework* framework, slave->frameworks) {
+              allocatedResources += framework->allocatedResources();
+            }
+
+            writer->field(
+                "reserved_resources_allocated",
+                [&allocatedResources, &approvers](JSON::ObjectWriter* writer) {
+                  foreachpair (const string& role,
+                               const Resources& resources,
+                               allocatedResources.reservations()) {
+                    if (approvers->approved<VIEW_ROLE>(role)) {
+                      writer->field(role, resources);
+                    }
+                  }
+                });
+
+            writer->field(
+                "unreserved_resources_allocated",
+                allocatedResources.unreserved());
+
+            writer->field("attributes", Attributes(slave->info.attributes()));
+
+            if (slave->master.isSome()) {
+              Try<string> hostname =
+                  net::getHostname(slave->master->address.ip);
+
+              if (hostname.isSome()) {
+                writer->field("master_hostname", hostname.get());
               }
             }
-          });
-        }
 
-        // Model all of the frameworks.
-        writer->field(
-            "frameworks",
-            [this, &frameworksApprover, &executorsApprover, &tasksApprover](
-                JSON::ArrayWriter* writer) {
-          foreachvalue (Framework* framework, slave->frameworks) {
-            // Skip unauthorized frameworks.
-            if (!approveViewFrameworkInfo(
-                    frameworksApprover, framework->info)) {
-              continue;
+            if (approvers->approved<VIEW_FLAGS>()) {
+              if (slave->flags.log_dir.isSome()) {
+                writer->field("log_dir", slave->flags.log_dir.get());
+              }
+
+              if (slave->flags.external_log_file.isSome()) {
+                writer->field(
+                    "external_log_file", slave->flags.external_log_file.get());
+              }
+
+              writer->field("flags", [this](JSON::ObjectWriter* writer) {
+                  foreachvalue (const flags::Flag& flag, slave->flags) {
+                    Option<string> value = flag.stringify(slave->flags);
+                    if (value.isSome()) {
+                      writer->field(flag.effective_name().value, value.get());
+                    }
+                  }
+                });
             }
 
-            FrameworkWriter frameworkWriter(
-                tasksApprover,
-                executorsApprover,
-                framework);
+            // Model all of the frameworks.
+            writer->field(
+                "frameworks",
+                [this, &approvers](JSON::ArrayWriter* writer) {
+                  foreachvalue (Framework* framework, slave->frameworks) {
+                    // Skip unauthorized frameworks.
+                    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+                      continue;
+                    }
 
-            writer->element(frameworkWriter);
-          }
-        });
+                    writer->element(FrameworkWriter(approvers, framework));
+                  }
+                });
 
-        // Model all of the completed frameworks.
-        writer->field(
-            "completed_frameworks",
-            [this, &frameworksApprover, &executorsApprover, &tasksApprover](
-                JSON::ArrayWriter* writer) {
-          foreachvalue (const Owned<Framework>& framework,
-                        slave->completedFrameworks) {
-            // Skip unauthorized frameworks.
-            if (!approveViewFrameworkInfo(
-                    frameworksApprover, framework->info)) {
-              continue;
-            }
+            // Model all of the completed frameworks.
+            writer->field(
+                "completed_frameworks",
+            [this, &approvers](JSON::ArrayWriter* writer) {
+                  foreachvalue (const Owned<Framework>& framework,
+                                slave->completedFrameworks) {
+                    // Skip unauthorized frameworks.
+                    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
+                      continue;
+                    }
 
-            FrameworkWriter frameworkWriter(
-                tasksApprover,
-                executorsApprover,
-                framework.get());
+                    writer->element(
+                        FrameworkWriter(approvers, framework.get()));
+                  }
+                });
+          };
 
-            writer->element(frameworkWriter);
-          }
-        });
-      };
-
-      return OK(jsonify(state), request.url.query.get("jsonp"));
-    }));
+          return OK(jsonify(state), request.url.query.get("jsonp"));
+        }));
 }
 
 
@@ -1515,39 +1457,28 @@ Future<Response> Http::getFrameworks(
 
   LOG(INFO) << "Processing GET_FRAMEWORKS call";
 
-  // Retrieve `ObjectApprover`s for authorizing frameworks.
-  Future<Owned<ObjectApprover>> frameworksApprover;
+  return ObjectApprovers::create(slave->authorizer, principal, {VIEW_FRAMEWORK})
+    .then(defer(
+        slave->self(),
+        [this, acceptType](
+            const Owned<ObjectApprovers>& approvers) -> Response {
+          mesos::agent::Response response;
+          response.set_type(mesos::agent::Response::GET_FRAMEWORKS);
+          *response.mutable_get_frameworks() = _getFrameworks(approvers);
 
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
-
-    frameworksApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_FRAMEWORK);
-  } else {
-    frameworksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return frameworksApprover
-    .then(defer(slave->self(),
-        [this, acceptType](const Owned<ObjectApprover>& frameworksApprover)
-          -> Future<Response> {
-      mesos::agent::Response response;
-      response.set_type(mesos::agent::Response::GET_FRAMEWORKS);
-      *response.mutable_get_frameworks() = _getFrameworks(frameworksApprover);
-
-      return OK(serialize(acceptType, evolve(response)),
-                stringify(acceptType));
-    }));
+          return OK(serialize(acceptType, evolve(response)),
+                    stringify(acceptType));
+        }));
 }
 
 
 mesos::agent::Response::GetFrameworks Http::_getFrameworks(
-    const Owned<ObjectApprover>& frameworksApprover) const
+    const Owned<ObjectApprovers>& approvers) const
 {
   mesos::agent::Response::GetFrameworks getFrameworks;
   foreachvalue (const Framework* framework, slave->frameworks) {
     // Skip unauthorized frameworks.
-    if (!approveViewFrameworkInfo(frameworksApprover, framework->info)) {
+    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
       continue;
     }
 
@@ -1557,7 +1488,7 @@ mesos::agent::Response::GetFrameworks Http::_getFrameworks(
 
   foreachvalue (const Owned<Framework>& framework, slave->completedFrameworks) {
     // Skip unauthorized frameworks.
-    if (!approveViewFrameworkInfo(frameworksApprover, framework->info)) {
+    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
       continue;
     }
 
@@ -1578,53 +1509,33 @@ Future<Response> Http::getExecutors(
 
   LOG(INFO) << "Processing GET_EXECUTORS call";
 
-  // Retrieve `ObjectApprover`s for authorizing frameworks and executors.
-  Future<Owned<ObjectApprover>> frameworksApprover;
-  Future<Owned<ObjectApprover>> executorsApprover;
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {VIEW_FRAMEWORK, VIEW_EXECUTOR})
+    .then(defer(
+        slave->self(),
+        [this, acceptType](
+            const Owned<ObjectApprovers>& approvers) -> Response {
+          mesos::agent::Response response;
+          response.set_type(mesos::agent::Response::GET_EXECUTORS);
 
-    frameworksApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_FRAMEWORK);
+          *response.mutable_get_executors() = _getExecutors(approvers);
 
-    executorsApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_EXECUTOR);
-  } else {
-    frameworksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    executorsApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return collect(frameworksApprover, executorsApprover)
-    .then(defer(slave->self(),
-        [this, acceptType](const tuple<Owned<ObjectApprover>,
-                                        Owned<ObjectApprover>>& approvers)
-          -> Future<Response> {
-      // Get approver from tuple.
-      Owned<ObjectApprover> frameworksApprover;
-      Owned<ObjectApprover> executorsApprover;
-      tie(frameworksApprover, executorsApprover) = approvers;
-
-      mesos::agent::Response response;
-      response.set_type(mesos::agent::Response::GET_EXECUTORS);
-
-      *response.mutable_get_executors() =
-        _getExecutors(frameworksApprover, executorsApprover);
-
-      return OK(serialize(acceptType, evolve(response)),
-                stringify(acceptType));
-    }));
+          return OK(serialize(acceptType, evolve(response)),
+                    stringify(acceptType));
+        }));
 }
 
 
 mesos::agent::Response::GetExecutors Http::_getExecutors(
-    const Owned<ObjectApprover>& frameworksApprover,
-    const Owned<ObjectApprover>& executorsApprover) const
+    const Owned<ObjectApprovers>& approvers) const
 {
   // Construct framework list with both active and completed frameworks.
   vector<const Framework*> frameworks;
   foreachvalue (Framework* framework, slave->frameworks) {
     // Skip unauthorized frameworks.
-    if (!approveViewFrameworkInfo(frameworksApprover, framework->info)) {
+    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
       continue;
     }
 
@@ -1633,7 +1544,7 @@ mesos::agent::Response::GetExecutors Http::_getExecutors(
 
   foreachvalue (const Owned<Framework>& framework, slave->completedFrameworks) {
     // Skip unauthorized frameworks.
-    if (!approveViewFrameworkInfo(frameworksApprover, framework->info)) {
+    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
       continue;
     }
 
@@ -1645,9 +1556,9 @@ mesos::agent::Response::GetExecutors Http::_getExecutors(
   foreach (const Framework* framework, frameworks) {
     foreachvalue (Executor* executor, framework->executors) {
       // Skip unauthorized executors.
-      if (!approveViewExecutorInfo(executorsApprover,
-                                   executor->info,
-                                   framework->info)) {
+      if (!approvers->approved<VIEW_EXECUTOR>(
+              executor->info,
+              framework->info)) {
         continue;
       }
 
@@ -1657,9 +1568,9 @@ mesos::agent::Response::GetExecutors Http::_getExecutors(
 
     foreach (const Owned<Executor>& executor, framework->completedExecutors) {
       // Skip unauthorized executors.
-      if (!approveViewExecutorInfo(executorsApprover,
-                                   executor->info,
-                                   framework->info)) {
+      if (!approvers->approved<VIEW_EXECUTOR>(
+              executor->info,
+              framework->info)) {
         continue;
       }
 
@@ -1672,6 +1583,61 @@ mesos::agent::Response::GetExecutors Http::_getExecutors(
 }
 
 
+Future<Response> Http::getOperations(
+    const mesos::agent::Call& call,
+    ContentType acceptType,
+    const Option<Principal>& principal) const
+{
+  CHECK_EQ(mesos::agent::Call::GET_OPERATIONS, call.type());
+
+  LOG(INFO) << "Processing GET_OPERATIONS call";
+
+  return ObjectApprovers::create(slave->authorizer, principal, {VIEW_ROLE})
+    .then(defer(
+        slave->self(),
+        [=](const Owned<ObjectApprovers>& approvers) -> Response {
+          // We consider a principal to be authorized to view an operation if it
+          // is authorized to view the resources the operation is performed on.
+          auto approved = [&approvers](const Operation& operation) {
+            Try<Resources> consumedResources =
+              protobuf::getConsumedResources(operation.info());
+
+            if (consumedResources.isError()) {
+              LOG(WARNING)
+                << "Could not approve operation " << operation.uuid()
+                << " since its consumed resources could not be determined: "
+                << consumedResources.error();
+
+              return false;
+            }
+
+            foreach (const Resource& resource, consumedResources.get()) {
+              if (!approvers->approved<VIEW_ROLE>(resource)) {
+                return false;
+              }
+            }
+
+            return true;
+          };
+
+          agent::Response response;
+          response.set_type(mesos::agent::Response::GET_OPERATIONS);
+
+          agent::Response::GetOperations* operations =
+            response.mutable_get_operations();
+
+          foreachvalue (Operation* operation, slave->operations) {
+            if (approved(*operation)) {
+              operations->add_operations()->CopyFrom(*operation);
+            }
+          }
+
+          return OK(
+              serialize(acceptType, evolve(response)), stringify(acceptType));
+        }));
+}
+
+
 Future<Response> Http::getTasks(
     const mesos::agent::Call& call,
     ContentType acceptType,
@@ -1681,61 +1647,33 @@ Future<Response> Http::getTasks(
 
   LOG(INFO) << "Processing GET_TASKS call";
 
-  // Retrieve Approvers for authorizing frameworks and tasks.
-  Future<Owned<ObjectApprover>> frameworksApprover;
-  Future<Owned<ObjectApprover>> tasksApprover;
-  Future<Owned<ObjectApprover>> executorsApprover;
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {VIEW_FRAMEWORK, VIEW_TASK, VIEW_EXECUTOR})
+    .then(defer(
+        slave->self(),
+        [this, acceptType](
+            const Owned<ObjectApprovers>& approvers) -> Response {
+          mesos::agent::Response response;
+          response.set_type(mesos::agent::Response::GET_TASKS);
 
-    frameworksApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_FRAMEWORK);
+          *response.mutable_get_tasks() = _getTasks(approvers);
 
-    tasksApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_TASK);
-
-    executorsApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_EXECUTOR);
-  } else {
-    frameworksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    tasksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    executorsApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return collect(frameworksApprover, tasksApprover, executorsApprover)
-    .then(defer(slave->self(),
-      [this, acceptType](const tuple<Owned<ObjectApprover>,
-                                      Owned<ObjectApprover>,
-                                      Owned<ObjectApprover>>& approvers)
-        -> Future<Response> {
-      // Get approver from tuple.
-      Owned<ObjectApprover> frameworksApprover;
-      Owned<ObjectApprover> tasksApprover;
-      Owned<ObjectApprover> executorsApprover;
-      tie(frameworksApprover, tasksApprover, executorsApprover) = approvers;
-
-      mesos::agent::Response response;
-      response.set_type(mesos::agent::Response::GET_TASKS);
-
-      *response.mutable_get_tasks() =
-        _getTasks(frameworksApprover, tasksApprover, executorsApprover);
-
-      return OK(serialize(acceptType, evolve(response)),
-                stringify(acceptType));
-  }));
+          return OK(serialize(acceptType, evolve(response)),
+                    stringify(acceptType));
+        }));
 }
 
 
 mesos::agent::Response::GetTasks Http::_getTasks(
-    const Owned<ObjectApprover>& frameworksApprover,
-    const Owned<ObjectApprover>& tasksApprover,
-    const Owned<ObjectApprover>& executorsApprover) const
+    const Owned<ObjectApprovers>& approvers) const
 {
   // Construct framework list with both active and completed frameworks.
   vector<const Framework*> frameworks;
   foreachvalue (Framework* framework, slave->frameworks) {
     // Skip unauthorized frameworks.
-    if (!approveViewFrameworkInfo(frameworksApprover, framework->info)) {
+    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
       continue;
     }
 
@@ -1744,7 +1682,7 @@ mesos::agent::Response::GetTasks Http::_getTasks(
 
   foreachvalue (const Owned<Framework>& framework, slave->completedFrameworks) {
     // Skip unauthorized frameworks.
-    if (!approveViewFrameworkInfo(frameworksApprover, framework->info)) {
+    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
       continue;
     }
 
@@ -1756,9 +1694,8 @@ mesos::agent::Response::GetTasks Http::_getTasks(
   foreach (const Framework* framework, frameworks) {
     foreachvalue (Executor* executor, framework->executors) {
       // Skip unauthorized executors.
-      if (!approveViewExecutorInfo(executorsApprover,
-                                   executor->info,
-                                   framework->info)) {
+      if (!approvers->approved<VIEW_EXECUTOR>(
+              executor->info, framework->info)) {
         continue;
       }
 
@@ -1767,9 +1704,8 @@ mesos::agent::Response::GetTasks Http::_getTasks(
 
     foreach (const Owned<Executor>& executor, framework->completedExecutors) {
       // Skip unauthorized executors.
-      if (!approveViewExecutorInfo(executorsApprover,
-                                   executor->info,
-                                   framework->info)) {
+      if (!approvers->approved<VIEW_EXECUTOR>(
+              executor->info, framework->info)) {
         continue;
       }
 
@@ -1785,7 +1721,7 @@ mesos::agent::Response::GetTasks Http::_getTasks(
     foreachvalue (const TaskMap& taskInfos, framework->pendingTasks) {
       foreachvalue (const TaskInfo& taskInfo, taskInfos) {
         // Skip unauthorized tasks.
-        if (!approveViewTaskInfo(tasksApprover, taskInfo, framework->info)) {
+        if (!approvers->approved<VIEW_TASK>(taskInfo, framework->info)) {
           continue;
         }
 
@@ -1803,7 +1739,7 @@ mesos::agent::Response::GetTasks Http::_getTasks(
     // Queued tasks.
     foreachvalue (const TaskInfo& taskInfo, executor->queuedTasks) {
       // Skip unauthorized tasks.
-      if (!approveViewTaskInfo(tasksApprover, taskInfo, framework->info)) {
+      if (!approvers->approved<VIEW_TASK>(taskInfo, framework->info)) {
         continue;
       }
 
@@ -1817,7 +1753,7 @@ mesos::agent::Response::GetTasks Http::_getTasks(
     foreachvalue (Task* task, executor->launchedTasks) {
       CHECK_NOTNULL(task);
       // Skip unauthorized tasks.
-      if (!approveViewTask(tasksApprover, *task, framework->info)) {
+      if (!approvers->approved<VIEW_TASK>(*task, framework->info)) {
         continue;
       }
 
@@ -1828,7 +1764,7 @@ mesos::agent::Response::GetTasks Http::_getTasks(
     foreachvalue (Task* task, executor->terminatedTasks) {
       CHECK_NOTNULL(task);
       // Skip unauthorized tasks.
-      if (!approveViewTask(tasksApprover, *task, framework->info)) {
+      if (!approvers->approved<VIEW_TASK>(*task, framework->info)) {
         continue;
       }
 
@@ -1838,7 +1774,7 @@ mesos::agent::Response::GetTasks Http::_getTasks(
     // Completed tasks.
     foreach (const std::shared_ptr<Task>& task, executor->completedTasks) {
       // Skip unauthorized tasks.
-      if (!approveViewTask(tasksApprover, *task.get(), framework->info)) {
+      if (!approvers->approved<VIEW_TASK>(*task.get(), framework->info)) {
         continue;
       }
 
@@ -1878,24 +1814,36 @@ Future<Response> Http::getResourceProviders(
 
   LOG(INFO) << "Processing GET_RESOURCE_PROVIDERS call";
 
-  // TODO(nfnt): Authorize this call (MESOS-8314).
+  return ObjectApprovers::create(
+      slave->authorizer, principal, {VIEW_RESOURCE_PROVIDER})
+    .then(defer(
+        slave->self(),
+        [this, acceptType](
+            const Owned<ObjectApprovers>& approvers) -> Response {
+          agent::Response response;
+          response.set_type(mesos::agent::Response::GET_RESOURCE_PROVIDERS);
 
-  agent::Response response;
-  response.set_type(mesos::agent::Response::GET_RESOURCE_PROVIDERS);
+          agent::Response::GetResourceProviders* resourceProviders =
+            response.mutable_get_resource_providers();
 
-  agent::Response::GetResourceProviders* resourceProviders =
-    response.mutable_get_resource_providers();
+          foreachvalue (
+              ResourceProvider* resourceProvider, slave->resourceProviders) {
+            if (!approvers->approved<VIEW_RESOURCE_PROVIDER>()) {
+              continue;
+            }
+            agent::Response::GetResourceProviders::ResourceProvider* provider =
+              resourceProviders->add_resource_providers();
 
-  foreachvalue (ResourceProvider* resourceProvider,
-                slave->resourceProviders) {
-    agent::Response::GetResourceProviders::ResourceProvider* provider =
-      resourceProviders->add_resource_providers();
+            provider->mutable_resource_provider_info()->CopyFrom(
+                resourceProvider->info);
 
-    provider->mutable_resource_provider_info()
-      ->CopyFrom(resourceProvider->info);
-  }
+            provider->mutable_total_resources()->CopyFrom(
+                resourceProvider->totalResources);
+          }
 
-  return OK(serialize(acceptType, evolve(response)), stringify(acceptType));
+          return OK(
+              serialize(acceptType, evolve(response)), stringify(acceptType));
+        }));
 }
 
 
@@ -1908,65 +1856,31 @@ Future<Response> Http::getState(
 
   LOG(INFO) << "Processing GET_STATE call";
 
-  // Retrieve Approvers for authorizing frameworks and tasks.
-  Future<Owned<ObjectApprover>> frameworksApprover;
-  Future<Owned<ObjectApprover>> tasksApprover;
-  Future<Owned<ObjectApprover>> executorsApprover;
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {VIEW_FRAMEWORK, VIEW_TASK, VIEW_EXECUTOR})
+    .then(defer(
+        slave->self(),
+        [=](const Owned<ObjectApprovers>& approvers) -> Response {
+          mesos::agent::Response response;
+          response.set_type(mesos::agent::Response::GET_STATE);
+          *response.mutable_get_state() = _getState(approvers);
 
-    frameworksApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_FRAMEWORK);
-
-    tasksApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_TASK);
-
-    executorsApprover = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_EXECUTOR);
-  } else {
-    frameworksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    tasksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    executorsApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return collect(frameworksApprover, tasksApprover, executorsApprover)
-    .then(defer(slave->self(),
-      [=](const tuple<Owned<ObjectApprover>,
-                      Owned<ObjectApprover>,
-                      Owned<ObjectApprover>>& approvers)
-        -> Future<Response> {
-      // Get approver from tuple.
-      Owned<ObjectApprover> frameworksApprover;
-      Owned<ObjectApprover> tasksApprover;
-      Owned<ObjectApprover> executorsApprover;
-      tie(frameworksApprover, tasksApprover, executorsApprover) = approvers;
-
-      mesos::agent::Response response;
-      response.set_type(mesos::agent::Response::GET_STATE);
-      *response.mutable_get_state() =
-        _getState(frameworksApprover, tasksApprover, executorsApprover);
-
-      return OK(serialize(acceptType, evolve(response)),
-                stringify(acceptType));
-    }));
+          return OK(serialize(acceptType, evolve(response)),
+                    stringify(acceptType));
+        }));
 }
 
 
 mesos::agent::Response::GetState Http::_getState(
-    const Owned<ObjectApprover>& frameworksApprover,
-    const Owned<ObjectApprover>& tasksApprover,
-    const Owned<ObjectApprover>& executorsApprover) const
+    const Owned<ObjectApprovers>& approvers) const
 {
   mesos::agent::Response::GetState getState;
 
-  *getState.mutable_get_tasks() =
-    _getTasks(frameworksApprover, tasksApprover, executorsApprover);
-
-  *getState.mutable_get_executors() =
-    _getExecutors(frameworksApprover, executorsApprover);
-
-  *getState.mutable_get_frameworks() =
-    _getFrameworks(frameworksApprover);
+  *getState.mutable_get_tasks() = _getTasks(approvers);
+  *getState.mutable_get_executors() = _getExecutors(approvers);
+  *getState.mutable_get_frameworks() = _getFrameworks(approvers);
 
   return getState;
 }
@@ -2163,32 +2077,21 @@ Future<Response> Http::getContainers(
 
   LOG(INFO) << "Processing GET_CONTAINERS call";
 
-  Future<Owned<AuthorizationAcceptor>> authorizeContainer =
-    AuthorizationAcceptor::create(
-        principal, slave->authorizer, authorization::VIEW_CONTAINER);
-
-  Future<Owned<AuthorizationAcceptor>> authorizeStandaloneContainer =
-    AuthorizationAcceptor::create(
-        principal, slave->authorizer, authorization::VIEW_STANDALONE_CONTAINER);
-
-  return collect(authorizeContainer, authorizeStandaloneContainer)
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {VIEW_CONTAINER, VIEW_STANDALONE_CONTAINER})
     .then(defer(
         slave->self(),
-        [this, call](const tuple<Owned<AuthorizationAcceptor>,
-                                 Owned<AuthorizationAcceptor>>& acceptors) {
-          Owned<AuthorizationAcceptor> authorizeContainer;
-          Owned<AuthorizationAcceptor> authorizeStandaloneContainer;
-          tie(authorizeContainer, authorizeStandaloneContainer) = acceptors;
-
+        [this, call](const Owned<ObjectApprovers>& approvers) {
           // Use an empty container ID filter.
           return __containers(
-              authorizeContainer,
-              authorizeStandaloneContainer,
+              approvers,
               None(),
               call.get_containers().show_nested(),
               call.get_containers().show_standalone());
-    })).then([acceptType](const Future<JSON::Array>& result)
-        -> Future<Response> {
+        }))
+    .then([acceptType](const Future<JSON::Array>& result) -> Response {
       if (!result.isReady()) {
         LOG(WARNING) << "Could not collect container status and statistics: "
                      << (result.isFailed()
@@ -2212,69 +2115,52 @@ Future<Response> Http::_containers(
     const Request& request,
     const Option<Principal>& principal) const
 {
-  Future<Owned<AuthorizationAcceptor>> authorizeContainer =
-    AuthorizationAcceptor::create(
-        principal, slave->authorizer, authorization::VIEW_CONTAINER);
+  Option<string> containerId = request.url.query.get("container_id");
 
-  Future<Owned<AuthorizationAcceptor>> authorizeStandaloneContainer =
-    AuthorizationAcceptor::create(
-        principal, slave->authorizer, authorization::VIEW_STANDALONE_CONTAINER);
-
-  Future<IDAcceptor<ContainerID>> selectContainerId =
-      IDAcceptor<ContainerID>(request.url.query.get("container_id"));
-
-  return collect(authorizeContainer,
-                 authorizeStandaloneContainer,
-                 selectContainerId)
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {VIEW_CONTAINER, VIEW_STANDALONE_CONTAINER})
     .then(defer(
         slave->self(),
-        [this](const tuple<Owned<AuthorizationAcceptor>,
-                           Owned<AuthorizationAcceptor>,
-                           IDAcceptor<ContainerID>>& acceptors) {
-          Owned<AuthorizationAcceptor> authorizeContainer;
-          Owned<AuthorizationAcceptor> authorizeStandaloneContainer;
-          Option<IDAcceptor<ContainerID>> selectContainerId;
-
-          tie(authorizeContainer,
-              authorizeStandaloneContainer,
-              selectContainerId) = acceptors;
+        [this, containerId](const Owned<ObjectApprovers>& approvers) {
+          IDAcceptor<ContainerID> selectContainerId(containerId);
 
           return __containers(
-              authorizeContainer,
-              authorizeStandaloneContainer,
+              approvers,
               selectContainerId,
               false,
               false);
-    })).then([request](const Future<JSON::Array>& result) -> Future<Response> {
-       if (!result.isReady()) {
-         LOG(WARNING) << "Could not collect container status and statistics: "
-                      << (result.isFailed()
-                           ? result.failure()
-                           : "Discarded");
+        }))
+    .then([request](const Future<JSON::Array>& result) -> Response {
+      if (!result.isReady()) {
+        LOG(WARNING) << "Could not collect container status and statistics: "
+                     << (result.isFailed()
+                         ? result.failure()
+                         : "Discarded");
 
-         return result.isFailed()
-           ? InternalServerError(result.failure())
-           : InternalServerError();
-       }
+        return result.isFailed()
+            ? InternalServerError(result.failure())
+            : InternalServerError();
+      }
 
-       return process::http::OK(
-           result.get(), request.url.query.get("jsonp"));
+      return process::http::OK(
+          result.get(), request.url.query.get("jsonp"));
     });
 }
 
 
 Future<JSON::Array> Http::__containers(
-    Owned<AuthorizationAcceptor> authorizeContainer,
-    Owned<AuthorizationAcceptor> authorizeStandaloneContainer,
+    const Owned<ObjectApprovers>& approvers,
     Option<IDAcceptor<ContainerID>> selectContainerId,
     bool showNestedContainers,
     bool showStandaloneContainers) const
 {
   return slave->containerizer->containers()
     .then(defer(slave->self(), [=](const hashset<ContainerID> containerIds) {
-      Owned<list<JSON::Object>> metadata(new list<JSON::Object>());
-      list<Future<ContainerStatus>> statusFutures;
-      list<Future<ResourceStatistics>> statsFutures;
+      Owned<vector<JSON::Object>> metadata(new vector<JSON::Object>());
+      vector<Future<ContainerStatus>> statusFutures;
+      vector<Future<ResourceStatistics>> statsFutures;
 
       hashset<ContainerID> executorContainerIds;
       hashset<ContainerID> authorizedExecutorContainerIds;
@@ -2294,7 +2180,7 @@ Future<JSON::Array> Http::__containers(
 
           if ((selectContainerId.isSome() &&
                !selectContainerId->accept(containerId)) ||
-              !authorizeContainer->accept(info, framework->info)) {
+              !approvers->approved<VIEW_CONTAINER>(info, framework->info)) {
             continue;
           }
 
@@ -2353,7 +2239,7 @@ Future<JSON::Array> Http::__containers(
         }
 
         if (isRootContainerStandalone &&
-            !authorizeStandaloneContainer->accept()) {
+            !approvers->approved<VIEW_STANDALONE_CONTAINER>()) {
           continue;
         }
 
@@ -2372,13 +2258,13 @@ Future<JSON::Array> Http::__containers(
 
       return await(await(statusFutures), await(statsFutures)).then(
           [metadata](const tuple<
-              Future<list<Future<ContainerStatus>>>,
-              Future<list<Future<ResourceStatistics>>>>& t)
+              Future<vector<Future<ContainerStatus>>>,
+              Future<vector<Future<ResourceStatistics>>>>& t)
               -> Future<JSON::Array> {
-            const list<Future<ContainerStatus>>& status =
+            const vector<Future<ContainerStatus>>& status =
               std::get<0>(t).get();
 
-            const list<Future<ResourceStatistics>>& stats =
+            const vector<Future<ResourceStatistics>>& stats =
               std::get<1>(t).get();
 
             CHECK_EQ(status.size(), stats.size());
@@ -2452,47 +2338,34 @@ Future<Response> Http::pruneImages(
               std::back_inserter(excludedImages));
   }
 
-  Future<Owned<ObjectApprover>> approver;
+  return ObjectApprovers::create(slave->authorizer, principal, {PRUNE_IMAGES})
+    .then(defer(
+        slave->self(),
+        [this, excludedImages](
+            const Owned<ObjectApprovers>& approvers) -> Future<Response> {
+          if (!approvers->approved<PRUNE_IMAGES>()) {
+            return Forbidden();
+          }
 
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
+          return slave->containerizer->pruneImages(excludedImages)
+            .then([](const Future<Nothing>& result) -> Response {
+                if (!result.isReady()) {
+                  // TODO(zhitao): Because `containerizer::pruneImages` returns
+                  // a `Nothing` now, we cannot distinguish between actual
+                  // failure or the case that operator should drain the agent.
+                  // Consider returning more information.
+                  LOG(WARNING)
+                      << "Failed to prune images: "
+                      << (result.isFailed() ? result.failure() : "discarded");
 
-    approver = slave->authorizer.get()->getObjectApprover(
-        subject,
-        authorization::PRUNE_IMAGES);
-  } else {
-    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
+                  return result.isFailed()
+                      ? InternalServerError(result.failure())
+                      : InternalServerError();
+                }
 
-  return approver
-    .then(defer(slave->self(), [this, excludedImages](
-        const Owned<ObjectApprover>& approver) -> Future<Response> {
-      Try<bool> approved = approver->approved(ObjectApprover::Object());
-      if (approved.isError()) {
-        return InternalServerError("Authorization error: " + approved.error());
-      } else if (!approved.get()) {
-        return Forbidden();
-      }
-
-      return slave->containerizer->pruneImages(excludedImages)
-          .then([](const Future<Nothing>& result) -> Future<Response> {
-            if (!result.isReady()) {
-              // TODO(zhitao): Because `containerizer::pruneImages` returns
-              // a `Nothing` now, we cannot distinguish between actual
-              // failure or the case that operator should drain the agent.
-              // Consider returning more information.
-              LOG(WARNING)
-                << "Failed to prune images: "
-                << (result.isFailed() ? result.failure() : "discarded");
-
-              return result.isFailed()
-                ? InternalServerError(result.failure())
-                : InternalServerError();
-            }
-
-            return OK();
-          });
-    }));
+                return OK();
+              });
+        }));
 }
 
 
@@ -2577,15 +2450,14 @@ Future<Response> Http::launchNestedContainer(
   LOG(INFO) << "Processing LAUNCH_NESTED_CONTAINER call for container '"
             << call.launch_nested_container().container_id() << "'";
 
-  Future<Owned<AuthorizationAcceptor>> authorizer =
-    AuthorizationAcceptor::create(
-        principal, slave->authorizer, authorization::LAUNCH_NESTED_CONTAINER);
-
-  return authorizer
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {LAUNCH_NESTED_CONTAINER})
     .then(defer(
         slave->self(),
-        [=](const Owned<AuthorizationAcceptor>& authorizer) {
-          return _launchContainer(
+        [=](const Owned<ObjectApprovers>& authorizer) {
+          return _launchContainer<LAUNCH_NESTED_CONTAINER>(
               call.launch_nested_container().container_id(),
               call.launch_nested_container().command(),
               None(),
@@ -2610,20 +2482,34 @@ Future<Response> Http::launchContainer(
   LOG(INFO) << "Processing LAUNCH_CONTAINER call for container '"
             << call.launch_container().container_id() << "'";
 
-  Future<Owned<AuthorizationAcceptor>> authorizer =
-    AuthorizationAcceptor::create(
-        principal,
-        slave->authorizer,
-        call.launch_container().container_id().has_parent()
-          ? authorization::LAUNCH_NESTED_CONTAINER
-          : authorization::LAUNCH_STANDALONE_CONTAINER);
+  if (call.launch_container().container_id().has_parent()) {
+    return launchContainer<LAUNCH_NESTED_CONTAINER>(
+        call,
+        acceptType,
+        principal);
+  }
 
-  return authorizer
+  return launchContainer<LAUNCH_STANDALONE_CONTAINER>(
+      call,
+      acceptType,
+      principal);
+}
+
+
+template <authorization::Action action>
+Future<Response> Http::launchContainer(
+    const mesos::agent::Call& call,
+    ContentType acceptType,
+    const Option<Principal>& principal) const
+{
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {action})
     .then(defer(
         slave->self(),
-        [=](const Owned<AuthorizationAcceptor>& authorizer)
-          -> Future<Response> {
-          return _launchContainer(
+        [=](const Owned<ObjectApprovers>& approvers) -> Future<Response> {
+          return _launchContainer<action>(
               call.launch_container().container_id(),
               call.launch_container().command(),
               call.launch_container().resources(),
@@ -2632,19 +2518,20 @@ Future<Response> Http::launchContainer(
                 : Option<ContainerInfo>::none(),
               ContainerClass::DEFAULT,
               acceptType,
-              authorizer);
+              approvers);
         }));
 }
 
 
+template <authorization::Action action>
 Future<Response> Http::_launchContainer(
     const ContainerID& containerId,
     const CommandInfo& commandInfo,
     const Option<Resources>& resources,
     const Option<ContainerInfo>& containerInfo,
     const Option<ContainerClass>& containerClass,
-    ContentType acceptType,
-    const Owned<AuthorizationAcceptor>& authorizer) const
+    ContentType,
+    const Owned<ObjectApprovers>& approvers) const
 {
   Option<string> user;
 
@@ -2654,14 +2541,14 @@ Future<Response> Http::_launchContainer(
   // launching a standalone container (possibly nested).
   Executor* executor = slave->getExecutor(containerId);
   if (executor == nullptr) {
-    if (!authorizer->accept(containerId)) {
+    if (!approvers->approved<action>(containerId)) {
       return Forbidden();
     }
   } else {
     Framework* framework = slave->getFramework(executor->frameworkId);
     CHECK_NOTNULL(framework);
 
-    if (!authorizer->accept(
+    if (!approvers->approved<action>(
             executor->info, framework->info, commandInfo, containerId)) {
       return Forbidden();
     }
@@ -2750,7 +2637,7 @@ Future<Response> Http::_launchContainer(
           << (launchResult.isFailed() ? launchResult.failure() : "discarded");
 
         slave->containerizer->destroy(containerId)
-          .onAny([=](const Future<bool>& destroy) {
+          .onAny([=](const Future<Option<ContainerTermination>>& destroy) {
             if (destroy.isReady()) {
               return;
             }
@@ -2798,18 +2685,17 @@ Future<Response> Http::waitNestedContainer(
   LOG(INFO) << "Processing WAIT_NESTED_CONTAINER call for container '"
             << call.wait_nested_container().container_id() << "'";
 
-  Future<Owned<AuthorizationAcceptor>> authorizer =
-    AuthorizationAcceptor::create(
-        principal, slave->authorizer, authorization::WAIT_NESTED_CONTAINER);
-
-  return authorizer
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {WAIT_NESTED_CONTAINER})
     .then(defer(
         slave->self(),
-        [=](const Owned<AuthorizationAcceptor>& authorizer) {
-          return _waitContainer(
+        [=](const Owned<ObjectApprovers>& approvers) {
+          return _waitContainer<WAIT_NESTED_CONTAINER>(
               call.wait_nested_container().container_id(),
               acceptType,
-              authorizer,
+              approvers,
               true);
         }));
 }
@@ -2826,31 +2712,41 @@ Future<Response> Http::waitContainer(
   LOG(INFO) << "Processing WAIT_CONTAINER call for container '"
             << call.wait_container().container_id() << "'";
 
-  Future<Owned<AuthorizationAcceptor>> authorizer =
-    AuthorizationAcceptor::create(
-        principal,
-        slave->authorizer,
-        call.wait_container().container_id().has_parent()
-          ? authorization::WAIT_NESTED_CONTAINER
-          : authorization::WAIT_STANDALONE_CONTAINER);
+  if (call.wait_container().container_id().has_parent()) {
+    return waitContainer<WAIT_NESTED_CONTAINER>(call, acceptType, principal);
+  }
 
-  return authorizer
+  return waitContainer<WAIT_STANDALONE_CONTAINER>(call, acceptType, principal);
+}
+
+
+template <authorization::Action action>
+Future<Response> Http::waitContainer(
+    const mesos::agent::Call& call,
+    ContentType acceptType,
+    const Option<Principal>& principal) const
+{
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {action})
     .then(defer(
         slave->self(),
-        [=](const Owned<AuthorizationAcceptor>& authorizer) {
-          return _waitContainer(
+        [=](const Owned<ObjectApprovers>& approvers) {
+          return _waitContainer<action>(
               call.wait_container().container_id(),
               acceptType,
-              authorizer,
+              approvers,
               false);
         }));
 }
 
 
+template <authorization::Action action>
 Future<Response> Http::_waitContainer(
     const ContainerID& containerId,
     ContentType acceptType,
-    const Owned<AuthorizationAcceptor>& authorizer,
+    const Owned<ObjectApprovers>& approvers,
     const bool deprecated) const
 {
   // Attempt to get the executor associated with this ContainerID.
@@ -2859,17 +2755,15 @@ Future<Response> Http::_waitContainer(
   // waiting on a standalone container (possibly nested).
   Executor* executor = slave->getExecutor(containerId);
   if (executor == nullptr) {
-    if (!authorizer->accept(containerId)) {
+    if (!approvers->approved<action>(containerId)) {
       return Forbidden();
     }
   } else {
     Framework* framework = slave->getFramework(executor->frameworkId);
     CHECK_NOTNULL(framework);
 
-    if (!authorizer->accept(
-            executor->info,
-            framework->info,
-            containerId)) {
+    if (!approvers->approved<action>(
+            executor->info, framework->info, containerId)) {
       return Forbidden();
     }
   }
@@ -2956,25 +2850,24 @@ Future<Response> Http::killNestedContainer(
   LOG(INFO) << "Processing KILL_NESTED_CONTAINER call for container '"
             << call.kill_nested_container().container_id() << "'";
 
-  Future<Owned<AuthorizationAcceptor>> authorizer =
-    AuthorizationAcceptor::create(
-        principal, slave->authorizer, authorization::KILL_NESTED_CONTAINER);
-
   // SIGKILL is used by default if a signal is not specified.
   int signal = SIGKILL;
   if (call.kill_nested_container().has_signal()) {
     signal = call.kill_nested_container().signal();
   }
 
-  return authorizer
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {KILL_NESTED_CONTAINER})
     .then(defer(
         slave->self(),
-        [=](const Owned<AuthorizationAcceptor>& authorizer) {
-          return _killContainer(
+        [=](const Owned<ObjectApprovers>& approvers) {
+          return _killContainer<KILL_NESTED_CONTAINER>(
               call.kill_nested_container().container_id(),
               signal,
               acceptType,
-              authorizer);
+              approvers);
         }));
 }
 
@@ -2990,38 +2883,48 @@ Future<Response> Http::killContainer(
   LOG(INFO) << "Processing KILL_CONTAINER call for container '"
             << call.kill_container().container_id() << "'";
 
-  Future<Owned<AuthorizationAcceptor>> authorizer =
-    AuthorizationAcceptor::create(
-        principal,
-        slave->authorizer,
-        call.kill_container().container_id().has_parent()
-          ? authorization::KILL_NESTED_CONTAINER
-          : authorization::KILL_STANDALONE_CONTAINER);
+  if (call.kill_container().container_id().has_parent()) {
+    return killContainer<KILL_NESTED_CONTAINER>(call, acceptType, principal);
+  }
 
+  return killContainer<KILL_STANDALONE_CONTAINER>(call, acceptType, principal);
+}
+
+
+template <mesos::authorization::Action action>
+Future<Response> Http::killContainer(
+    const mesos::agent::Call& call,
+    ContentType acceptType,
+    const Option<Principal>& principal) const
+{
   // SIGKILL is used by default if a signal is not specified.
   int signal = SIGKILL;
   if (call.kill_container().has_signal()) {
     signal = call.kill_container().signal();
   }
 
-  return authorizer
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {action})
     .then(defer(
         slave->self(),
-        [=](const Owned<AuthorizationAcceptor>& authorizer) {
-          return _killContainer(
+        [=](const Owned<ObjectApprovers>& approvers) {
+          return _killContainer<action>(
               call.kill_container().container_id(),
               signal,
               acceptType,
-              authorizer);
+              approvers);
         }));
 }
 
 
+template <mesos::authorization::Action action>
 Future<Response> Http::_killContainer(
     const ContainerID& containerId,
     const int signal,
     ContentType acceptType,
-    const Owned<AuthorizationAcceptor>& authorizer) const
+    const Owned<ObjectApprovers>& approvers) const
 {
   // Attempt to get the executor associated with this ContainerID.
   // We only expect to get the executor when killing a nested container
@@ -3029,14 +2932,14 @@ Future<Response> Http::_killContainer(
   // killing a standalone container (possibly nested).
   Executor* executor = slave->getExecutor(containerId);
   if (executor == nullptr) {
-    if (!authorizer->accept(containerId)) {
+    if (!approvers->approved<action>(containerId)) {
       return Forbidden();
     }
   } else {
     Framework* framework = slave->getFramework(executor->frameworkId);
     CHECK_NOTNULL(framework);
 
-    if (!authorizer->accept(
+    if (!approvers->approved<action>(
             executor->info,
             framework->info,
             containerId)) {
@@ -3068,19 +2971,18 @@ Future<Response> Http::removeNestedContainer(
   LOG(INFO) << "Processing REMOVE_NESTED_CONTAINER call for container '"
             << call.remove_nested_container().container_id() << "'";
 
-  Future<Owned<AuthorizationAcceptor>> authorizer =
-    AuthorizationAcceptor::create(
-        principal, slave->authorizer, authorization::REMOVE_NESTED_CONTAINER);
-
-  return authorizer
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {REMOVE_NESTED_CONTAINER})
     .then(defer(
-        slave->self(),
-        [=](const Owned<AuthorizationAcceptor>& authorizer) {
-          return _removeContainer(
-              call.remove_nested_container().container_id(),
-              acceptType,
-              authorizer);
-        }));
+      slave->self(),
+      [=](const Owned<ObjectApprovers>& approvers) {
+        return _removeContainer<REMOVE_NESTED_CONTAINER>(
+            call.remove_nested_container().container_id(),
+            acceptType,
+            approvers);
+      }));
 }
 
 
@@ -3095,30 +2997,46 @@ Future<Response> Http::removeContainer(
   LOG(INFO) << "Processing REMOVE_CONTAINER call for container '"
             << call.remove_container().container_id() << "'";
 
-  Future<Owned<AuthorizationAcceptor>> authorizer =
-    AuthorizationAcceptor::create(
-        principal,
-        slave->authorizer,
-        call.remove_container().container_id().has_parent()
-          ? authorization::REMOVE_NESTED_CONTAINER
-          : authorization::REMOVE_STANDALONE_CONTAINER);
+  if (call.remove_container().container_id().has_parent()) {
+    return removeContainer<REMOVE_NESTED_CONTAINER>(
+        call,
+        acceptType,
+        principal);
+  }
 
-  return authorizer
+  return removeContainer<REMOVE_STANDALONE_CONTAINER>(
+      call,
+      acceptType,
+      principal);
+}
+
+
+template <mesos::authorization::Action action>
+Future<Response> Http::removeContainer(
+    const mesos::agent::Call& call,
+    ContentType acceptType,
+    const Option<Principal>& principal) const
+{
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {action})
     .then(defer(
         slave->self(),
-        [=](const Owned<AuthorizationAcceptor>& authorizer) {
-          return _removeContainer(
+        [=](const Owned<ObjectApprovers>& approvers) {
+          return _removeContainer<action>(
               call.remove_container().container_id(),
               acceptType,
-              authorizer);
+              approvers);
         }));
 }
 
 
+template <mesos::authorization::Action action>
 Future<Response> Http::_removeContainer(
     const ContainerID& containerId,
     ContentType acceptType,
-    const Owned<AuthorizationAcceptor>& authorizer) const
+    const Owned<ObjectApprovers>& approvers) const
 {
   // Attempt to get the executor associated with this ContainerID.
   // We only expect to get the executor when removing a nested container
@@ -3126,14 +3044,14 @@ Future<Response> Http::_removeContainer(
   // removing a standalone container (possibly nested).
   Executor* executor = slave->getExecutor(containerId);
   if (executor == nullptr) {
-    if (!authorizer->accept(containerId)) {
+    if (!approvers->approved<action>(containerId)) {
       return Forbidden();
     }
   } else {
     Framework* framework = slave->getFramework(executor->frameworkId);
     CHECK_NOTNULL(framework);
 
-    if (!authorizer->accept(
+    if (!approvers->approved<action>(
             executor->info,
             framework->info,
             containerId)) {
@@ -3245,46 +3163,37 @@ Future<Response> Http::attachContainerInput(
   LOG(INFO) << "Processing ATTACH_CONTAINER_INPUT call for container '"
             << call.attach_container_input().container_id() << "'";
 
-  Future<Owned<ObjectApprover>> approver;
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {ATTACH_CONTAINER_INPUT})
+    .then(defer(
+        slave->self(),
+        [this, call, decoder, mediaTypes](
+            const Owned<ObjectApprovers>& approvers) -> Future<Response> {
+          const ContainerID& containerId =
+              call.attach_container_input().container_id();
 
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
+          Executor* executor = slave->getExecutor(containerId);
+          if (executor == nullptr) {
+            return NotFound(
+                "Container " + stringify(containerId) + " cannot be found");
+          }
 
-    approver = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::ATTACH_CONTAINER_INPUT);
-  } else {
-    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
+          Framework* framework = slave->getFramework(executor->frameworkId);
+          CHECK_NOTNULL(framework);
 
-  return approver.then(defer(slave->self(),
-    [this, call, decoder, mediaTypes](
-        const Owned<ObjectApprover>& attachInputApprover) -> Future<Response> {
-      const ContainerID& containerId =
-        call.attach_container_input().container_id();
+          if (!approvers->approved<ATTACH_CONTAINER_INPUT>(
+                  executor->info,
+                  framework->info)) {
+            return Forbidden();
+          }
 
-      Executor* executor = slave->getExecutor(containerId);
-      if (executor == nullptr) {
-        return NotFound(
-            "Container " + stringify(containerId) + " cannot be found");
-      }
+          Owned<Reader<mesos::agent::Call>> decoder_ = decoder;
 
-      Framework* framework = slave->getFramework(executor->frameworkId);
-      CHECK_NOTNULL(framework);
-
-      Try<bool> approved = attachInputApprover->approved(
-          ObjectApprover::Object(executor->info, framework->info));
-
-      if (approved.isError()) {
-        return Failure(approved.error());
-      } else if (!approved.get()) {
-        return Forbidden();
-      }
-
-      Owned<Reader<mesos::agent::Call>> decoder_ = decoder;
-
-      return _attachContainerInput(
-          call, std::move(decoder_), mediaTypes);
-  }));
+          return _attachContainerInput(
+              call, std::move(decoder_), mediaTypes);
+        }));
 }
 
 
@@ -3295,52 +3204,41 @@ Future<Response> Http::addResourceProviderConfig(
   CHECK_EQ(mesos::agent::Call::ADD_RESOURCE_PROVIDER_CONFIG, call.type());
   CHECK(call.has_add_resource_provider_config());
 
-  Future<Owned<ObjectApprover>> approver;
-
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
-
-    approver = slave->authorizer.get()->getObjectApprover(
-        subject,
-        authorization::MODIFY_RESOURCE_PROVIDER_CONFIG);
-  } else {
-    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return approver
-    .then(defer(slave->self(), [=](
-        const Owned<ObjectApprover>& approver) -> Future<Response> {
-      Try<bool> approved = approver->approved(ObjectApprover::Object());
-      if (approved.isError()) {
-        return InternalServerError("Authorization error: " + approved.error());
-      } else if (!approved.get()) {
-        return Forbidden();
-      }
-
-      const ResourceProviderInfo& info =
-        call.add_resource_provider_config().info();
-
-      LOG(INFO)
-        << "Processing ADD_RESOURCE_PROVIDER_CONFIG call with type '"
-        << info.type() << "' and name '" << info.name() << "'";
-
-      return slave->localResourceProviderDaemon->add(info)
-        .then([](bool added) -> Response {
-          if (!added) {
-            return Conflict();
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {MODIFY_RESOURCE_PROVIDER_CONFIG})
+    .then(defer(
+        slave->self(),
+        [=](const Owned<ObjectApprovers>& approvers) -> Future<Response> {
+          if (!approvers->approved<MODIFY_RESOURCE_PROVIDER_CONFIG>()) {
+            return Forbidden();
           }
 
-          return OK();
-        })
-        .repair([info](const Future<Response>& future) {
-          LOG(ERROR)
-            << "Failed to add resource provider config with type '"
-            << info.type() << "' and name '" << info.name() << "': "
-            << future.failure();
+          const ResourceProviderInfo& info =
+              call.add_resource_provider_config().info();
 
-          return InternalServerError(future.failure());
-        });
-    }));
+          LOG(INFO)
+              << "Processing ADD_RESOURCE_PROVIDER_CONFIG call with type '"
+              << info.type() << "' and name '" << info.name() << "'";
+
+          return slave->localResourceProviderDaemon->add(info)
+            .then([](bool added) -> Response {
+              if (!added) {
+                return Conflict();
+              }
+
+              return OK();
+            })
+            .repair([info](const Future<Response>& future) {
+                LOG(ERROR)
+                    << "Failed to add resource provider config with type '"
+                    << info.type() << "' and name '" << info.name() << "': "
+                    << future.failure();
+
+                return InternalServerError(future.failure());
+              });
+        }));
 }
 
 
@@ -3351,52 +3249,41 @@ Future<Response> Http::updateResourceProviderConfig(
   CHECK_EQ(mesos::agent::Call::UPDATE_RESOURCE_PROVIDER_CONFIG, call.type());
   CHECK(call.has_update_resource_provider_config());
 
-  Future<Owned<ObjectApprover>> approver;
-
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
-
-    approver = slave->authorizer.get()->getObjectApprover(
-        subject,
-        authorization::MODIFY_RESOURCE_PROVIDER_CONFIG);
-  } else {
-    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return approver
-    .then(defer(slave->self(), [=](
-        const Owned<ObjectApprover>& approver) -> Future<Response> {
-      Try<bool> approved = approver->approved(ObjectApprover::Object());
-      if (approved.isError()) {
-        return InternalServerError("Authorization error: " + approved.error());
-      } else if (!approved.get()) {
-        return Forbidden();
-      }
-
-      const ResourceProviderInfo& info =
-        call.update_resource_provider_config().info();
-
-      LOG(INFO)
-        << "Processing UPDATE_RESOURCE_PROVIDER_CONFIG call with type '"
-        << info.type() << "' and name '" << info.name() << "'";
-
-      return slave->localResourceProviderDaemon->update(info)
-        .then([](bool updated) -> Response {
-          if (!updated) {
-            return NotFound();
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {MODIFY_RESOURCE_PROVIDER_CONFIG})
+    .then(defer(
+        slave->self(),
+        [=](const Owned<ObjectApprovers>& approvers) -> Future<Response> {
+          if (!approvers->approved<MODIFY_RESOURCE_PROVIDER_CONFIG>()) {
+            return Forbidden();
           }
 
-          return OK();
-        })
-        .repair([info](const Future<Response>& future) {
-          LOG(ERROR)
-            << "Failed to update resource provider config with type '"
-            << info.type() << "' and name '" << info.name() << "': "
-            << future.failure();
+          const ResourceProviderInfo& info =
+              call.update_resource_provider_config().info();
 
-          return InternalServerError(future.failure());
-        });
-    }));
+          LOG(INFO)
+              << "Processing UPDATE_RESOURCE_PROVIDER_CONFIG call with type '"
+              << info.type() << "' and name '" << info.name() << "'";
+
+          return slave->localResourceProviderDaemon->update(info)
+            .then([](bool updated) -> Response {
+              if (!updated) {
+                return NotFound();
+              }
+
+              return OK();
+            })
+            .repair([info](const Future<Response>& future) {
+                LOG(ERROR)
+                    << "Failed to update resource provider config with type '"
+                    << info.type() << "' and name '" << info.name() << "': "
+                    << future.failure();
+
+                return InternalServerError(future.failure());
+              });
+        }));
 }
 
 
@@ -3407,51 +3294,38 @@ Future<Response> Http::removeResourceProviderConfig(
   CHECK_EQ(mesos::agent::Call::REMOVE_RESOURCE_PROVIDER_CONFIG, call.type());
   CHECK(call.has_remove_resource_provider_config());
 
-  Future<Owned<ObjectApprover>> approver;
-
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
-
-    approver = slave->authorizer.get()->getObjectApprover(
-        subject,
-        authorization::MODIFY_RESOURCE_PROVIDER_CONFIG);
-  } else {
-    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return approver
-    .then(defer(slave->self(), [=](
-        const Owned<ObjectApprover>& approver) -> Future<Response> {
-      Try<bool> approved = approver->approved(ObjectApprover::Object());
-      if (approved.isError()) {
-        return InternalServerError("Authorization error: " + approved.error());
-      } else if (!approved.get()) {
-        return Forbidden();
-      }
-
-      const string& type = call.remove_resource_provider_config().type();
-      const string& name = call.remove_resource_provider_config().name();
-
-      LOG(INFO)
-        << "Processing REMOVE_RESOURCE_PROVIDER_CONFIG call with type '" << type
-        << "' and name '" << name << "'";
-
-      return slave->localResourceProviderDaemon->remove(type, name)
-        .then([](bool removed) -> Response {
-          if (!removed) {
-            return NotFound();
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {MODIFY_RESOURCE_PROVIDER_CONFIG})
+    .then(defer(
+        slave->self(),
+        [=](const Owned<ObjectApprovers>& approvers) -> Future<Response> {
+          if (!approvers->approved<MODIFY_RESOURCE_PROVIDER_CONFIG>()) {
+            return Forbidden();
           }
 
-          return OK();
-        })
-        .repair([type, name](const Future<Response>& future) {
-          LOG(ERROR)
-            << "Failed to remove resource provider config with type '" << type
-            << "' and name '" << name << "': " << future.failure();
+          const string& type = call.remove_resource_provider_config().type();
+          const string& name = call.remove_resource_provider_config().name();
 
-          return InternalServerError(future.failure());
-        });
-    }));
+          LOG(INFO)
+              << "Processing REMOVE_RESOURCE_PROVIDER_CONFIG call with type '"
+              << type << "' and name '" << name << "'";
+
+          return slave->localResourceProviderDaemon->remove(type, name)
+            .then([]() -> Response {
+              // Config removal is always successful due to idempotency.
+              return OK();
+            })
+            .repair([type, name](const Future<Response>& future) {
+              LOG(ERROR)
+                  << "Failed to remove resource provider config with type '"
+                  << type << "' and name '" << name << "': "
+                  << future.failure();
+
+              return InternalServerError(future.failure());
+            });
+      }));
 }
 
 
@@ -3492,28 +3366,6 @@ Future<Response> Http::launchNestedContainerSession(
   LOG(INFO) << "Processing LAUNCH_NESTED_CONTAINER_SESSION call for container '"
             << call.launch_nested_container_session().container_id() << "'";
 
-  Future<Owned<AuthorizationAcceptor>> authorizer =
-    AuthorizationAcceptor::create(
-        principal,
-        slave->authorizer,
-        authorization::LAUNCH_NESTED_CONTAINER_SESSION);
-
-  Future<Response> response = authorizer
-    .then(defer(
-        slave->self(),
-        [=](const Owned<AuthorizationAcceptor>& authorizer) {
-          return _launchContainer(
-              call.launch_nested_container_session().container_id(),
-              call.launch_nested_container_session().command(),
-              None(),
-              call.launch_nested_container_session().has_container()
-                ? call.launch_nested_container_session().container()
-                : Option<ContainerInfo>::none(),
-              ContainerClass::DEBUG,
-              mediaTypes.accept,
-              authorizer);
-        }));
-
   // Helper to destroy the container.
   auto destroy = [this](const ContainerID& containerId) {
     slave->containerizer->destroy(containerId)
@@ -3523,94 +3375,125 @@ Future<Response> Http::launchNestedContainerSession(
       });
   };
 
-  // If `response` has failed or is not `OK`, the container will be
-  // destroyed by `_launchContainer`.
-  return response
-    .then(defer(slave->self(),
-                [=](const Response& response) -> Future<Response> {
-      const ContainerID& containerId =
-        call.launch_nested_container_session().container_id();
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {LAUNCH_NESTED_CONTAINER_SESSION})
+    .then(defer(
+      slave->self(),
+      [=](const Owned<ObjectApprovers>& approvers) {
+        return _launchContainer<LAUNCH_NESTED_CONTAINER_SESSION>(
+            call.launch_nested_container_session().container_id(),
+            call.launch_nested_container_session().command(),
+            None(),
+            call.launch_nested_container_session().has_container()
+              ? call.launch_nested_container_session().container()
+              : Option<ContainerInfo>::none(),
+            ContainerClass::DEBUG,
+            mediaTypes.accept,
+            approvers);
+      }))
+    .then(defer(
+      slave->self(),
+      [=](const Response& response) -> Future<Response> {
+        // If `response` has failed or is not `OK`, the container will be
+        // destroyed by `_launchContainer`.
+        const ContainerID& containerId =
+            call.launch_nested_container_session().container_id();
 
-      if (response.status != OK().status) {
-        return response;
-      }
+        if (response.status != OK().status) {
+          return response;
+        }
 
-      // If launch is successful, attach to the container output.
-      mesos::agent::Call call;
-      call.set_type(mesos::agent::Call::ATTACH_CONTAINER_OUTPUT);
-      call.mutable_attach_container_output()->mutable_container_id()
-          ->CopyFrom(containerId);
+        // If launch is successful, attach to the container output.
+        mesos::agent::Call call;
+        call.set_type(mesos::agent::Call::ATTACH_CONTAINER_OUTPUT);
+        call.mutable_attach_container_output()->mutable_container_id()
+            ->CopyFrom(containerId);
 
-      // Instead of directly returning the response of `attachContainerOutput`
-      // to the client, we use a level of indirection to make sure the container
-      // is destroyed when the client connection breaks.
-      return attachContainerOutput(call, mediaTypes, principal)
-        .then(defer(slave->self(),
-                    [=](const Response& response) -> Future<Response> {
-          if (response.status != OK().status) {
-            return response;
-          }
+        // Instead of directly returning the response of `attachContainerOutput`
+        // to the client, we use a level of indirection to make sure the
+        // container is destroyed when the client connection breaks.
+        return attachContainerOutput(call, mediaTypes, principal)
+          .then(defer(
+              slave->self(),
+              [=](const Response& response) -> Future<Response> {
+                if (response.status != OK().status) {
+                  LOG(WARNING) << "Failed to attach to nested container "
+                               << containerId << ": '" << response.status
+                                << "' (" << response.body << ")";
 
-          Pipe pipe;
-          Pipe::Writer writer = pipe.writer();
+                  destroy(containerId);
+                  return response;
+                }
 
-          OK ok;
-          ok.headers = response.headers; // Reuse the headers from the response.
-          ok.type = Response::PIPE;
-          ok.reader = pipe.reader();
+                Pipe pipe;
+                Pipe::Writer writer = pipe.writer();
 
-          CHECK_EQ(Response::PIPE, response.type);
-          CHECK_SOME(response.reader);
-          Pipe::Reader reader = response.reader.get();
+                OK ok;
+                ok.headers = response.headers; // Reuse headers from response.
+                ok.type = Response::PIPE;
+                ok.reader = pipe.reader();
 
-          // Read from the `response` pipe and write to
-          // the client's response pipe.
-          // NOTE: Need to cast the lambda to std::function here because of a
-          // limitation of `defer`; `defer` does not work with `mutable` lambda.
-          std::function<void (const Future<Nothing>&)> _connect =
-            [=](const Future<Nothing>& future) mutable {
-              CHECK(!future.isDiscarded());
+                CHECK_EQ(Response::PIPE, response.type);
+                CHECK_SOME(response.reader);
+                Pipe::Reader reader = response.reader.get();
 
-              if (future.isFailed()) {
-                LOG(WARNING) << "Failed to send attach response for "
-                             << containerId << ": " << future.failure();
+                // Read from the `response` pipe and write to
+                // the client's response pipe.
+                // NOTE: Need to cast the lambda to std::function here because
+                // of a limitation of `defer`; `defer` does not work with
+                // `mutable` lambda.
+                std::function<void (const Future<Nothing>&)> _connect =
+                    [=](const Future<Nothing>& future) mutable {
+                      CHECK(!future.isDiscarded());
 
-                writer.fail(future.failure());
-                reader.close();
-              } else {
-                // EOF case.
-                LOG(INFO) << "Received EOF attach response for " << containerId;
+                      if (future.isFailed()) {
+                        LOG(WARNING) << "Failed to send attach response for "
+                                     << containerId << ": " << future.failure();
 
-                writer.close();
-                reader.close();
-              }
+                        writer.fail(future.failure());
+                        reader.close();
+                      } else {
+                        // EOF case.
+                        LOG(INFO) << "Received EOF attach response for "
+                                  << containerId;
 
-              destroy(containerId);
-          };
+                        writer.close();
+                        reader.close();
+                      }
 
-          connect(reader, writer)
-            .onAny(defer(slave->self(), _connect));
+                      destroy(containerId);
+                };
 
-          // Destroy the container if the connection to client is closed.
-          writer.readerClosed()
-            .onAny(defer(slave->self(), [=](const Future<Nothing>& future) {
-              LOG(WARNING)
-                << "Launch nested container session connection"
-                << " for container " << containerId << " closed"
-                << (future.isFailed() ? ": " + future.failure() : "");
+                connect(reader, writer).onAny(defer(slave->self(), _connect));
 
-              destroy(containerId);
-            }));
+                // Destroy the container if the connection to client is closed.
+                writer.readerClosed()
+                  .onAny(defer(
+                      slave->self(),
+                      [=](const Future<Nothing>& future) {
+                        LOG(WARNING)
+                            << "Launch nested container session connection"
+                            << " for container " << containerId << " closed"
+                            << (future.isFailed()
+                                ? ": " + future.failure()
+                                : "");
 
-          return ok;
-        }))
-        .onFailed(defer(slave->self(), [=](const string& failure) {
-          LOG(WARNING) << "Failed to attach to nested container "
-                       << containerId << ": " << failure;
+                        destroy(containerId);
+                      }));
 
-          destroy(containerId);
-        }));
-    }));
+                return ok;
+              }))
+          .onFailed(defer(
+              slave->self(),
+              [=](const string& failure) {
+                LOG(WARNING) << "Failed to attach to nested container "
+                             << containerId << ": " << failure;
+
+                destroy(containerId);
+              }));
+      }));
 }
 
 
@@ -3727,47 +3610,32 @@ Future<Response> Http::attachContainerOutput(
 
   LOG(INFO) << "Processing ATTACH_CONTAINER_OUTPUT call for container '"
             << call.attach_container_output().container_id() << "'";
+  return ObjectApprovers::create(
+      slave->authorizer,
+      principal,
+      {ATTACH_CONTAINER_OUTPUT})
+    .then(defer(
+        slave->self(),
+        [=](const Owned<ObjectApprovers>& approvers) -> Future<Response> {
+          const ContainerID& containerId =
+              call.attach_container_output().container_id();
 
-  Future<Owned<ObjectApprover>> approver;
+          Executor* executor = slave->getExecutor(containerId);
+          if (executor == nullptr) {
+            return NotFound(
+                "Container " + stringify(containerId) + " cannot be found");
+          }
 
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
+          Framework* framework = slave->getFramework(executor->frameworkId);
+          CHECK_NOTNULL(framework);
 
-    approver = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::ATTACH_CONTAINER_OUTPUT);
-  } else {
-    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
+          if (!approvers->approved<ATTACH_CONTAINER_OUTPUT>(
+                  executor->info, framework->info, containerId)) {
+            return Forbidden();
+          }
 
-  return approver.then(defer(slave->self(),
-    [this, call, mediaTypes](
-        const Owned<ObjectApprover>& attachOutputApprover) -> Future<Response> {
-      const ContainerID& containerId =
-        call.attach_container_output().container_id();
-
-      Executor* executor = slave->getExecutor(containerId);
-      if (executor == nullptr) {
-        return NotFound(
-            "Container " + stringify(containerId) + " cannot be found");
-      }
-
-      Framework* framework = slave->getFramework(executor->frameworkId);
-      CHECK_NOTNULL(framework);
-
-      Try<bool> approved = attachOutputApprover->approved(
-          ObjectApprover::Object(
-              executor->info,
-              framework->info,
-              containerId));
-
-      if (approved.isError()) {
-        return Failure(approved.error());
-      } else if (!approved.get()) {
-        return Forbidden();
-      }
-
-      return _attachContainerOutput(call, mediaTypes);
-  }));
+          return _attachContainerOutput(call, mediaTypes);
+      }));
 }
 
 } // namespace slave {

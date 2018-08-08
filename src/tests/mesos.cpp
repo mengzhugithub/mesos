@@ -31,6 +31,8 @@
 #include <stout/stringify.hpp>
 #include <stout/uuid.hpp>
 
+#include "common/http.hpp"
+
 #ifdef __linux__
 #include "linux/cgroups.hpp"
 #endif
@@ -327,13 +329,23 @@ Try<Owned<cluster::Master>> MesosTest::StartMaster(
 
 Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     MasterDetector* detector,
-    const Option<slave::Flags>& flags)
+    const Option<slave::Flags>& flags,
+    bool mock)
 {
   Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
       detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get());
+      flags.isNone() ? CreateSlaveFlags() : flags.get(),
+      None(),
+      None(),
+      None(),
+      None(),
+      None(),
+      None(),
+      None(),
+      None(),
+      mock);
 
-  if (slave.isSome()) {
+  if (slave.isSome() && !mock) {
     slave.get()->start();
   }
 
@@ -371,14 +383,23 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
 Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     MasterDetector* detector,
     const string& id,
-    const Option<slave::Flags>& flags)
+    const Option<slave::Flags>& flags,
+    bool mock)
 {
   Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
       detector,
       flags.isNone() ? CreateSlaveFlags() : flags.get(),
-      id);
+      id,
+      None(),
+      None(),
+      None(),
+      None(),
+      None(),
+      None(),
+      None(),
+      mock);
 
-  if (slave.isSome()) {
+  if (slave.isSome() && !mock) {
     slave.get()->start();
   }
 
@@ -409,16 +430,23 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
 Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     MasterDetector* detector,
     slave::GarbageCollector* gc,
-    const Option<slave::Flags>& flags)
+    const Option<slave::Flags>& flags,
+    bool mock)
 {
   Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
       detector,
       flags.isNone() ? CreateSlaveFlags() : flags.get(),
       None(),
       None(),
-      gc);
+      gc,
+      None(),
+      None(),
+      None(),
+      None(),
+      None(),
+      mock);
 
-  if (slave.isSome()) {
+  if (slave.isSome() && !mock) {
     slave.get()->start();
   }
 
@@ -525,7 +553,8 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
 Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     mesos::master::detector::MasterDetector* detector,
     mesos::Authorizer* authorizer,
-    const Option<slave::Flags>& flags)
+    const Option<slave::Flags>& flags,
+    bool mock)
 {
   Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
       detector,
@@ -537,9 +566,10 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
       None(),
       None(),
       None(),
-      authorizer);
+      authorizer,
+      mock);
 
-  if (slave.isSome()) {
+  if (slave.isSome() && !mock) {
     slave.get()->start();
   }
 
@@ -551,7 +581,8 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
     mesos::master::detector::MasterDetector* detector,
     slave::Containerizer* containerizer,
     mesos::Authorizer* authorizer,
-    const Option<slave::Flags>& flags)
+    const Option<slave::Flags>& flags,
+    bool mock)
 {
   Try<Owned<cluster::Slave>> slave = cluster::Slave::create(
       detector,
@@ -563,9 +594,10 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
       None(),
       None(),
       None(),
-      authorizer);
+      authorizer,
+      mock);
 
-  if (slave.isSome()) {
+  if (slave.isSome() && !mock) {
     slave.get()->start();
   }
 
@@ -644,17 +676,6 @@ MockExecutor::~MockExecutor() {}
 
 MockAuthorizer::MockAuthorizer()
 {
-  // Implementation of the ObjectApprover interface authorizing all objects.
-  class ObjectApproverAll : public ObjectApprover
-  {
-  public:
-    virtual Try<bool> approved(
-        const Option<ObjectApprover::Object>& object) const noexcept override
-    {
-      return true;
-    }
-  };
-
   // NOTE: We use 'EXPECT_CALL' and 'WillRepeatedly' here instead of
   // 'ON_CALL' and 'WillByDefault'. See 'TestContainerizer::SetUp()'
   // for more details.
@@ -662,11 +683,22 @@ MockAuthorizer::MockAuthorizer()
     .WillRepeatedly(Return(true));
 
   EXPECT_CALL(*this, getObjectApprover(_, _))
-    .WillRepeatedly(Return(Owned<ObjectApprover>(new ObjectApproverAll())));
+    .WillRepeatedly(Return(Owned<ObjectApprover>(
+        new AcceptingObjectApprover())));
 }
 
 
 MockAuthorizer::~MockAuthorizer() {}
+
+
+MockGarbageCollector::MockGarbageCollector(const string& workDir)
+    : slave::GarbageCollector(workDir)
+{
+  EXPECT_CALL(*this, unschedule(_)).WillRepeatedly(Return(true));
+}
+
+
+MockGarbageCollector::~MockGarbageCollector() {}
 
 
 slave::Flags ContainerizerTest<slave::MesosContainerizer>::CreateSlaveFlags()

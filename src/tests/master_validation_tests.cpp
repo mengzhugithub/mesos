@@ -1065,8 +1065,6 @@ TEST_F(CreateOperationValidationTest, SharedVolumeBasedOnCapability)
 // than the offered disk resource results won't succeed.
 TEST_F(CreateOperationValidationTest, InsufficientDiskResource)
 {
-  protobuf::slave::Capabilities capabilities;
-
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
   frameworkInfo.set_roles(0, "role1");
 
@@ -1462,7 +1460,305 @@ TEST_F(DestroyOperationValidationTest, MultipleResourceProviders)
 }
 
 
-TEST(OperationValidationTest, CreateVolume)
+class GrowVolumeOperationValidationTest : public MesosTest {
+protected:
+  Offer::Operation::GrowVolume createGrowVolume()
+  {
+    Resource volume = createPersistentVolume(
+        Megabytes(128),
+        "role1",
+        "id1",
+        "path1");
+
+    Resource addition = Resources::parse("disk", "128", "role1").get();
+
+    Offer::Operation::GrowVolume growVolume;
+    growVolume.mutable_volume()->CopyFrom(volume);
+    growVolume.mutable_addition()->CopyFrom(addition);
+
+    return growVolume;
+  }
+};
+
+
+// This test verifies that validation succeeds on a valid operation.
+TEST_F(GrowVolumeOperationValidationTest, Valid)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_NONE(error);
+}
+
+
+// This test verifies that validation fails if `GrowVolume.volume` is not a
+// persistent volume.
+TEST_F(GrowVolumeOperationValidationTest, NonPersistentVolume)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+  growVolume.mutable_volume()->mutable_disk()->clear_persistence();
+
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `GrowVolume.addition` has a zero
+// value.
+TEST_F(GrowVolumeOperationValidationTest, ZeroAddition)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+  growVolume.mutable_addition()->mutable_scalar()->set_value(0);
+
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `GrowVolume.volume` and
+// `GrowVolume.addition' are incompatible.
+TEST_F(GrowVolumeOperationValidationTest, IncompatibleDisk)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  // Make the volume on a PATH disk so it cannot be grown with a ROOT disk.
+  Resource pathVolume = createPersistentVolume(
+       Megabytes(128),
+        "role1",
+        "id1",
+        "path1",
+        None(),
+        createDiskSourcePath("root"));
+
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+  growVolume.mutable_volume()->CopyFrom(pathVolume);
+
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `GrowVolume.volume` is a shared
+// persistent volume.
+TEST_F(GrowVolumeOperationValidationTest, Shared)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+  growVolume.mutable_volume()->mutable_shared();
+
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `GrowVolume.volume` has resource
+// provider id.
+TEST_F(GrowVolumeOperationValidationTest, ResourceProvider)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+  growVolume.mutable_volume()->mutable_provider_id()->set_value("provider");
+
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `GrowVolume.volume` and
+// `GrowVolume.addition` are on MOUNT disks, which are not addable.
+TEST_F(GrowVolumeOperationValidationTest, Mount)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Resource mountVolume = createPersistentVolume(
+       Megabytes(128),
+        "role1",
+        "id1",
+        "path1",
+        None(),
+        createDiskSourceMount());
+
+  Resource mountDisk = createDiskResource(
+      "128", "role1", None(), None(), createDiskSourceMount());
+
+  Offer::Operation::GrowVolume growVolume = createGrowVolume();
+  growVolume.mutable_volume()->CopyFrom(mountVolume);
+  growVolume.mutable_addition()->CopyFrom(mountDisk);
+
+  Option<Error> error = operation::validate(growVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation  fails if agent has no RESIZE_VOLUME
+// capability.
+TEST_F(GrowVolumeOperationValidationTest, MissingCapability)
+{
+  protobuf::slave::Capabilities capabilities;
+
+  Option<Error> error = operation::validate(createGrowVolume(), capabilities);
+  EXPECT_SOME(error);
+}
+
+
+class ShrinkVolumeOperationValidationTest : public MesosTest {
+protected:
+  Offer::Operation::ShrinkVolume createShrinkVolume()
+  {
+    Resource volume = createPersistentVolume(
+        Megabytes(128),
+        "role1",
+        "id1",
+        "path1");
+
+    Offer::Operation::ShrinkVolume shrinkVolume;
+    shrinkVolume.mutable_volume()->CopyFrom(volume);
+    shrinkVolume.mutable_subtract()->set_value(64);
+
+    return shrinkVolume;
+  }
+};
+
+
+// This test verifies that validation succeeds on a valid `ShrinkVolume`
+// operation.
+TEST_F(ShrinkVolumeOperationValidationTest, Valid)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_NONE(error);
+}
+
+
+// This test verifies that validation fails if `ShrinkVolume.volume` is not a
+// persistent volume.
+TEST_F(ShrinkVolumeOperationValidationTest, NonPersistentVolume)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+  shrinkVolume.mutable_volume()->mutable_disk()->clear_persistence();
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `ShrinkVolume.subtract` has a
+// zero value.
+TEST_F(ShrinkVolumeOperationValidationTest, ZeroSubtract)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+  shrinkVolume.mutable_subtract()->set_value(0);
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `ShrinkVolume.subtract` has a
+// value equal to the size of `ShrinkVolume.volume`
+TEST_F(ShrinkVolumeOperationValidationTest, EmptyAfterShrink)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+  shrinkVolume.mutable_subtract()->CopyFrom(shrinkVolume.volume().scalar());
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `ShrinkVolume.volume` is a
+// MOUNT disk.
+TEST_F(ShrinkVolumeOperationValidationTest, Mount)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Resource mountVolume = createPersistentVolume(
+       Megabytes(128),
+        "role1",
+        "id1",
+        "path1",
+        None(),
+        createDiskSourceMount());
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+  shrinkVolume.mutable_volume()->CopyFrom(mountVolume);
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `ShrinkVolume.volume` is a
+// shared volume.
+TEST_F(ShrinkVolumeOperationValidationTest, Shared)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+  shrinkVolume.mutable_volume()->mutable_shared();
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if `ShrinkVolume.volume` has
+// resource provider id.
+TEST_F(ShrinkVolumeOperationValidationTest, ResourceProvider)
+{
+  protobuf::slave::Capabilities capabilities;
+  capabilities.resizeVolume = true;
+
+  Offer::Operation::ShrinkVolume shrinkVolume = createShrinkVolume();
+  shrinkVolume.mutable_volume()->mutable_provider_id()->set_value("provider");
+
+  Option<Error> error = operation::validate(shrinkVolume, capabilities);
+  EXPECT_SOME(error);
+}
+
+
+// This test verifies that validation fails if agent has no RESIZE_VOLUME
+// capability.
+TEST_F(ShrinkVolumeOperationValidationTest, MissingCapability)
+{
+  protobuf::slave::Capabilities capabilities;
+
+  Option<Error> error = operation::validate(createShrinkVolume(), capabilities);
+  EXPECT_SOME(error);
+}
+
+
+TEST(OperationValidationTest, CreateDisk)
 {
   Resource disk1 = createDiskResource(
       "10", "*", None(), None(), createDiskSourceRaw());
@@ -1476,153 +1772,92 @@ TEST(OperationValidationTest, CreateVolume)
   disk1.mutable_provider_id()->set_value("provider1");
   disk2.mutable_provider_id()->set_value("provider2");
 
-  Offer::Operation::CreateVolume createVolume;
-  createVolume.mutable_source()->CopyFrom(disk1);
-  createVolume.set_target_type(Resource::DiskInfo::Source::MOUNT);
+  Offer::Operation::CreateDisk createDisk;
+  createDisk.mutable_source()->CopyFrom(disk1);
+  createDisk.set_target_type(Resource::DiskInfo::Source::MOUNT);
 
-  Option<Error> error = operation::validate(createVolume);
+  Option<Error> error = operation::validate(createDisk);
   EXPECT_NONE(error);
 
-  createVolume.mutable_source()->CopyFrom(disk2);
-  createVolume.set_target_type(Resource::DiskInfo::Source::MOUNT);
+  createDisk.mutable_source()->CopyFrom(disk1);
+  createDisk.set_target_type(Resource::DiskInfo::Source::BLOCK);
 
-  error = operation::validate(createVolume);
+  error = operation::validate(createDisk);
+  EXPECT_NONE(error);
+
+  createDisk.mutable_source()->CopyFrom(disk1);
+  createDisk.set_target_type(Resource::DiskInfo::Source::PATH);
+
+  error = operation::validate(createDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "'target_type' is neither MOUNT or BLOCK"));
+
+  createDisk.mutable_source()->CopyFrom(disk2);
+  createDisk.set_target_type(Resource::DiskInfo::Source::MOUNT);
+
+  error = operation::validate(createDisk);
   ASSERT_SOME(error);
   EXPECT_TRUE(strings::contains(
       error->message,
       "'source' is not a RAW disk resource"));
 
-  createVolume.mutable_source()->CopyFrom(disk3);
-  createVolume.set_target_type(Resource::DiskInfo::Source::PATH);
+  createDisk.mutable_source()->CopyFrom(disk3);
+  createDisk.set_target_type(Resource::DiskInfo::Source::MOUNT);
 
-  error = operation::validate(createVolume);
+  error = operation::validate(createDisk);
   ASSERT_SOME(error);
   EXPECT_TRUE(strings::contains(
       error->message,
-      "Does not have a resource provider"));
-
-  createVolume.mutable_source()->CopyFrom(disk1);
-  createVolume.set_target_type(Resource::DiskInfo::Source::BLOCK);
-
-  error = operation::validate(createVolume);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "'target_type' is neither MOUNT or PATH"));
+      "'source' is not managed by a resource provider"));
 }
 
 
-TEST(OperationValidationTest, DestroyVolume)
+TEST(OperationValidationTest, DestroyDisk)
 {
   Resource disk1 = createDiskResource(
       "10", "*", None(), None(), createDiskSourceMount());
 
   Resource disk2 = createDiskResource(
-      "20", "*", None(), None(), createDiskSourcePath());
-
-  Resource disk3 = createDiskResource(
-      "30", "*", None(), None(), createDiskSourceRaw());
-
-  disk1.mutable_provider_id()->set_value("provider1");
-  disk3.mutable_provider_id()->set_value("provider3");
-
-  Offer::Operation::DestroyVolume destroyVolume;
-  destroyVolume.mutable_volume()->CopyFrom(disk1);
-
-  Option<Error> error = operation::validate(destroyVolume);
-  EXPECT_NONE(error);
-
-  destroyVolume.mutable_volume()->CopyFrom(disk2);
-
-  error = operation::validate(destroyVolume);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "Does not have a resource provider"));
-
-  destroyVolume.mutable_volume()->CopyFrom(disk3);
-
-  error = operation::validate(destroyVolume);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "'volume' is neither a MOUTN or PATH disk resource"));
-}
-
-
-TEST(OperationValidationTest, CreateBlock)
-{
-  Resource disk1 = createDiskResource(
-      "10", "*", None(), None(), createDiskSourceRaw());
-
-  Resource disk2 = createDiskResource(
-      "20", "*", None(), None(), createDiskSourceMount());
-
-  Resource disk3 = createDiskResource(
-      "30", "*", None(), None(), createDiskSourceRaw());
-
-  disk1.mutable_provider_id()->set_value("provider1");
-  disk2.mutable_provider_id()->set_value("provider2");
-
-  Offer::Operation::CreateBlock createBlock;
-  createBlock.mutable_source()->CopyFrom(disk1);
-
-  Option<Error> error = operation::validate(createBlock);
-  EXPECT_NONE(error);
-
-  createBlock.mutable_source()->CopyFrom(disk2);
-
-  error = operation::validate(createBlock);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "'source' is not a RAW disk resource"));
-
-  createBlock.mutable_source()->CopyFrom(disk3);
-
-  error = operation::validate(createBlock);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "Does not have a resource provider"));
-}
-
-
-TEST(OperationValidationTest, DestroyBlock)
-{
-  Resource disk1 = createDiskResource(
-      "10", "*", None(), None(), createDiskSourceBlock());
-
-  Resource disk2 = createDiskResource(
       "20", "*", None(), None(), createDiskSourceBlock());
 
   Resource disk3 = createDiskResource(
-      "30", "*", None(), None(), createDiskSourceMount());
+      "30", "*", None(), None(), createDiskSourcePath());
+
+  Resource disk4 = createDiskResource(
+      "40", "*", None(), None(), createDiskSourceMount());
 
   disk1.mutable_provider_id()->set_value("provider1");
+  disk2.mutable_provider_id()->set_value("provider2");
   disk3.mutable_provider_id()->set_value("provider3");
 
-  Offer::Operation::DestroyBlock destroyBlock;
-  destroyBlock.mutable_block()->CopyFrom(disk1);
+  Offer::Operation::DestroyDisk destroyDisk;
+  destroyDisk.mutable_source()->CopyFrom(disk1);
 
-  Option<Error> error = operation::validate(destroyBlock);
+  Option<Error> error = operation::validate(destroyDisk);
   EXPECT_NONE(error);
 
-  destroyBlock.mutable_block()->CopyFrom(disk2);
+  destroyDisk.mutable_source()->CopyFrom(disk2);
 
-  error = operation::validate(destroyBlock);
+  error = operation::validate(destroyDisk);
+  EXPECT_NONE(error);
+
+  destroyDisk.mutable_source()->CopyFrom(disk3);
+
+  error = operation::validate(destroyDisk);
   ASSERT_SOME(error);
   EXPECT_TRUE(strings::contains(
       error->message,
-      "Does not have a resource provider"));
+      "'source' is neither a MOUNT or BLOCK disk resource"));
 
-  destroyBlock.mutable_block()->CopyFrom(disk3);
+  destroyDisk.mutable_source()->CopyFrom(disk4);
 
-  error = operation::validate(destroyBlock);
+  error = operation::validate(destroyDisk);
   ASSERT_SOME(error);
   EXPECT_TRUE(strings::contains(
       error->message,
-      "'block' is not a BLOCK disk resource"));
+      "'source' is not managed by a resource provider"));
 }
 
 
@@ -2777,6 +3012,112 @@ TEST_F(TaskValidationTest, TaskEnvironmentInvalid)
   driver.join();
 }
 
+
+// This test verifies that a task that has `ContainerInfo` set as DOCKER
+// but has no `DockerInfo` is rejected during `TaskInfo` validation.
+TEST_F(TaskValidationTest, TaskMissingDockerInfo)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  // Create an invalid task that has `ContainerInfo` set
+  // as DOCKER but has no `DockerInfo`.
+  TaskInfo task = createTask(offers.get()[0], "exit 0");
+  task.mutable_container()->set_type(ContainerInfo::DOCKER);
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_ERROR, status->state());
+  EXPECT_EQ(
+      "Task's `ContainerInfo` is invalid: "
+      "DockerInfo 'docker' is not set for DOCKER typed ContainerInfo",
+      status->message());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that a task that has `name` parameter set
+// in `DockerInfo` is rejected during `TaskInfo` validation.
+TEST_F(TaskValidationTest, TaskSettingDockerParameterName)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  // Create an invalid task that has `name` parameter set in `DockerInfo`.
+  TaskInfo task = createTask(offers.get()[0], "exit 0");
+  task.mutable_container()->set_type(ContainerInfo::DOCKER);
+  task.mutable_container()->mutable_docker()->set_image("alpine");
+
+  Parameter* parameter =
+      task.mutable_container()->mutable_docker()->add_parameters();
+
+  parameter->set_key("name");
+  parameter->set_value("test");
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_ERROR, status->state());
+  EXPECT_EQ(
+      "Task's `ContainerInfo` is invalid: "
+      "Parameter in DockerInfo must not be 'name'",
+      status->message());
+
+  driver.stop();
+  driver.join();
+}
+
 // TODO(jieyu): Add tests for checking duplicated persistence ID
 // against offered resources.
 
@@ -3387,6 +3728,7 @@ TEST_F(TaskGroupValidationTest, TaskUsesDockerContainerInfo)
   task1.mutable_slave_id()->MergeFrom(offer.slave_id());
   task1.mutable_resources()->MergeFrom(resources);
   task1.mutable_container()->set_type(ContainerInfo::DOCKER);
+  task1.mutable_container()->mutable_docker()->set_image("alpine");
 
   // Create a valid task.
   TaskInfo task2;
@@ -3434,22 +3776,29 @@ TEST_F(TaskGroupValidationTest, TaskUsesDockerContainerInfo)
 }
 
 
-// Ensures that a task in a task group that has `NetworkInfo`
-// set is rejected during `TaskGroupInfo` validation.
-TEST_F(TaskGroupValidationTest, TaskUsesNetworkInfo)
+// Ensures that a task in a task group that has `NetworkInfo` set does
+// not have HTTP health checks during `TaskGroupInfo` validation.
+TEST_F(TaskGroupValidationTest, TaskWithNetworkInfosDoesNotHaveHTTPHealthChecks)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
+
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
   ASSERT_SOME(slave);
 
   MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _));
+  MesosSchedulerDriver driver(
+      &sched,
+      DEFAULT_FRAMEWORK_INFO,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -3458,41 +3807,43 @@ TEST_F(TaskGroupValidationTest, TaskUsesNetworkInfo)
 
   driver.start();
 
+  AWAIT_READY(frameworkId);
+
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->empty());
   Offer offer = offers.get()[0];
 
-  Resources resources = Resources::parse("cpus:1;mem:512;disk:32").get();
+  Resources resources = Resources::parse("cpus:0.5;mem:300;disk:100").get();
 
   ExecutorInfo executor(DEFAULT_EXECUTOR_INFO);
   executor.set_type(ExecutorInfo::CUSTOM);
   executor.mutable_resources()->CopyFrom(resources);
+  executor.mutable_framework_id()->CopyFrom(frameworkId.get());
 
-  // Create an invalid task that has NetworkInfos set.
-  TaskInfo task1;
-  task1.set_name("1");
-  task1.mutable_task_id()->set_value("1");
-  task1.mutable_slave_id()->MergeFrom(offer.slave_id());
-  task1.mutable_resources()->MergeFrom(resources);
-  task1.mutable_container()->set_type(ContainerInfo::MESOS);
-  task1.mutable_container()->add_network_infos();
+  TaskInfo task;
+  task.set_name("1");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offer.slave_id());
+  task.mutable_resources()->MergeFrom(resources);
+  task.mutable_container()->set_type(ContainerInfo::MESOS);
+  task.mutable_container()->add_network_infos();
 
-  // Create a valid task.
-  TaskInfo task2;
-  task2.set_name("2");
-  task2.mutable_task_id()->set_value("2");
-  task2.mutable_slave_id()->MergeFrom(offer.slave_id());
-  task2.mutable_resources()->MergeFrom(resources);
+  // Add a HTTP health check to this task.
+  HealthCheck healthCheck;
+  healthCheck.set_type(HealthCheck::HTTP);
+  healthCheck.mutable_http()->set_port(80);
+  healthCheck.set_delay_seconds(0);
+  healthCheck.set_interval_seconds(0);
+  healthCheck.set_grace_period_seconds(15);
+
+  task.mutable_health_check()->CopyFrom(healthCheck);
 
   TaskGroupInfo taskGroup;
-  taskGroup.add_tasks()->CopyFrom(task1);
-  taskGroup.add_tasks()->CopyFrom(task2);
+  taskGroup.add_tasks()->CopyFrom(task);
 
-  Future<TaskStatus> task1Status;
-  Future<TaskStatus> task2Status;
+  Future<TaskStatus> taskStatus;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&task1Status))
-    .WillOnce(FutureArg<1>(&task2Status));
+    .WillOnce(FutureArg<1>(&taskStatus));
 
   Offer::Operation operation;
   operation.set_type(Offer::Operation::LAUNCH_GROUP);
@@ -3505,17 +3856,109 @@ TEST_F(TaskGroupValidationTest, TaskUsesNetworkInfo)
 
   driver.acceptOffers({offer.id()}, {operation});
 
-  AWAIT_READY(task1Status);
-  EXPECT_EQ(task1.task_id(), task1Status->task_id());
-  EXPECT_EQ(TASK_ERROR, task1Status->state());
-  EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task1Status->reason());
-  EXPECT_EQ("Task '1' is invalid: NetworkInfos must not be set on the task",
-            task1Status->message());
+  const string expected =
+    "Task '1' is invalid: HTTP and TCP health checks are not supported "
+    "for nested containers not joining parent's network";
 
-  AWAIT_READY(task2Status);
-  EXPECT_EQ(task2.task_id(), task2Status->task_id());
-  EXPECT_EQ(TASK_ERROR, task2Status->state());
-  EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task2Status->reason());
+  AWAIT_READY(taskStatus);
+  EXPECT_EQ(task.task_id(), taskStatus->task_id());
+  EXPECT_EQ(TASK_ERROR, taskStatus->state());
+  EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, taskStatus->reason());
+  EXPECT_EQ(expected, taskStatus->message());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// Ensures that a task in a task group that has `NetworkInfo` set does
+// not have TCP health checks during `TaskGroupInfo` validation.
+TEST_F(TaskGroupValidationTest, TaskWithNetworkInfosDoesNotHaveTCPHealthChecks)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched,
+      DEFAULT_FRAMEWORK_INFO,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+  Offer offer = offers.get()[0];
+
+  Resources resources = Resources::parse("cpus:0.5;mem:300;disk:100").get();
+
+  ExecutorInfo executor(DEFAULT_EXECUTOR_INFO);
+  executor.set_type(ExecutorInfo::DEFAULT);
+  executor.mutable_resources()->CopyFrom(resources);
+  executor.mutable_framework_id()->CopyFrom(frameworkId.get());
+
+  TaskInfo task;
+  task.set_name("1");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offer.slave_id());
+  task.mutable_resources()->MergeFrom(resources);
+  task.mutable_container()->set_type(ContainerInfo::MESOS);
+  task.mutable_container()->add_network_infos();
+
+  // Add a TCP health check to this task.
+  HealthCheck healthCheck;
+  healthCheck.set_type(HealthCheck::TCP);
+  healthCheck.mutable_tcp()->set_port(30000);
+  healthCheck.set_delay_seconds(0);
+  healthCheck.set_interval_seconds(0);
+  healthCheck.set_grace_period_seconds(15);
+
+  task.mutable_health_check()->CopyFrom(healthCheck);
+
+  TaskGroupInfo taskGroup;
+  taskGroup.add_tasks()->CopyFrom(task);
+
+  Future<TaskStatus> taskStatus;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&taskStatus));
+
+  Offer::Operation operation;
+  operation.set_type(Offer::Operation::LAUNCH_GROUP);
+
+  Offer::Operation::LaunchGroup* launchGroup =
+    operation.mutable_launch_group();
+
+  launchGroup->mutable_executor()->CopyFrom(executor);
+  launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+  driver.acceptOffers({offer.id()}, {operation});
+
+  const string expected =
+    "Task '1' is invalid: HTTP and TCP health checks are not supported "
+    "for nested containers not joining parent's network";
+
+  AWAIT_READY(taskStatus);
+  EXPECT_EQ(task.task_id(), taskStatus->task_id());
+  EXPECT_EQ(TASK_ERROR, taskStatus->state());
+  EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, taskStatus->reason());
+  EXPECT_EQ(expected, taskStatus->message());
 
   driver.stop();
   driver.join();
@@ -4136,10 +4579,10 @@ TEST_F(FrameworkInfoValidationTest, DowngradeFromMultipleRoles)
 
   // Downgrade `frameworkInfo` to remove `MULTI_ROLE` capability, and
   // migrate from `roles` to `role` field.
-  ASSERT_EQ(2u, frameworkInfo.roles_size());
+  ASSERT_EQ(2, frameworkInfo.roles_size());
   frameworkInfo.set_role(frameworkInfo.roles(0));
   frameworkInfo.clear_roles();
-  ASSERT_EQ(1u, frameworkInfo.capabilities_size());
+  ASSERT_EQ(1, frameworkInfo.capabilities_size());
   frameworkInfo.clear_capabilities();
 
   {
